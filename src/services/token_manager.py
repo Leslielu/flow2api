@@ -390,10 +390,17 @@ class TokenManager:
 
             debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: 尝试通过浏览器刷新 ST...")
 
-            from .browser_captcha_personal import BrowserCaptchaService
-            service = await BrowserCaptchaService.get_instance(self.db)
+            # 根据 browser_driver 配置选择正确的服务
+            browser_driver = getattr(config, 'browser_driver_attr', 'nodriver')
 
-            new_st = await service.refresh_session_token(token.current_project_id)
+            if browser_driver == "drission":
+                from .browser_captcha_drission import DrissionCaptchaService
+                service = await DrissionCaptchaService.get_instance(self.db)
+                new_st = await service.refresh_session_token(token.current_project_id)
+            else:
+                from .browser_captcha_personal import BrowserCaptchaService
+                service = await BrowserCaptchaService.get_instance(self.db)
+                new_st = await service.refresh_session_token(token.current_project_id)
             if new_st and new_st != token.st:
                 # 更新数据库中的 ST
                 await self.db.update_token(token_id, st=new_st)

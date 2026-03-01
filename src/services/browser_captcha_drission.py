@@ -264,7 +264,8 @@ class DrissionCaptchaService:
             # 尝试访问 url 属性来检查浏览器是否存活
             _ = self.browser.url
             return True
-        except:
+        except Exception as e:
+            debug_logger.log_error(f"[DrissionCaptcha] 浏览器存活检查失败: {type(e).__name__}: {str(e)[:100]}")
             return False
 
     def _sync_new_tab(self, url: str):
@@ -427,30 +428,32 @@ class DrissionCaptchaService:
 
     async def initialize(self):
         """初始化 DrissionPage 浏览器"""
-        # 检查服务是否可用
-        self._check_available()
+        # 使用锁防止并发初始化
+        async with self._lock:
+            # 检查服务是否可用
+            self._check_available()
 
-        if self._initialized and self.browser:
-            # 检查浏览器是否仍然存活
-            is_alive = await _run_in_thread(self._sync_check_browser_alive)
-            if is_alive:
-                return
-            else:
-                debug_logger.log_warning("[DrissionCaptcha] 浏览器已停止，重新初始化...")
-                self._initialized = False
+            if self._initialized and self.browser:
+                # 检查浏览器是否仍然存活
+                is_alive = await _run_in_thread(self._sync_check_browser_alive)
+                if is_alive:
+                    return
+                else:
+                    debug_logger.log_warning("[DrissionCaptcha] 浏览器已停止，重新初始化...")
+                    self._initialized = False
 
-        try:
-            debug_logger.log_info("[DrissionCaptcha] 开始在线程池中创建浏览器...")
-            # 在线程池中创建浏览器
-            self.browser = await _run_in_thread(self._sync_create_browser)
-            self._initialized = True
-            debug_logger.log_info("[DrissionCaptcha] 浏览器创建完成，已设置 _initialized=True")
+            try:
+                debug_logger.log_info("[DrissionCaptcha] 开始在线程池中创建浏览器...")
+                # 在线程池中创建浏览器
+                self.browser = await _run_in_thread(self._sync_create_browser)
+                self._initialized = True
+                debug_logger.log_info("[DrissionCaptcha] 浏览器创建完成，已设置 _initialized=True")
 
-            # 启动心跳任务
-            self._start_heartbeat()
-        except Exception as e:
-            debug_logger.log_error(f"[DrissionCaptcha] ❌ 浏览器启动失败: {str(e)}")
-            raise
+                # 启动心跳任务
+                self._start_heartbeat()
+            except Exception as e:
+                debug_logger.log_error(f"[DrissionCaptcha] ❌ 浏览器启动失败: {str(e)}")
+                raise
 
     async def start_resident_mode(self, project_id: str):
         """启动常驻模式
