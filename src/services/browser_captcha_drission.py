@@ -1,0 +1,1024 @@
+"""
+浏览器自动化获取 reCAPTCHA token
+使用 DrissionPage 实现反检测浏览器
+支持常驻模式：为每个 project_id 自动创建常驻标签页，即时生成 token
+"""
+import asyncio
+import time
+import os
+import sys
+import subprocess
+from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
+
+from ..core.logger import debug_logger
+
+
+# ==================== Docker 环境检测 ====================
+def _is_running_in_docker() -> bool:
+    """检测是否在 Docker 容器中运行"""
+    # 方法1: 检查 /.dockerenv 文件
+    if os.path.exists('/.dockerenv'):
+        return True
+    # 方法2: 检查 cgroup
+    try:
+        with open('/proc/1/cgroup', 'r') as f:
+            content = f.read()
+            if 'docker' in content or 'kubepods' in content or 'containerd' in content:
+                return True
+    except:
+        pass
+    # 方法3: 检查环境变量
+    if os.environ.get('DOCKER_CONTAINER') or os.environ.get('KUBERNETES_SERVICE_HOST'):
+        return True
+    return False
+
+
+IS_DOCKER = _is_running_in_docker()
+
+
+# ==================== DrissionPage 自动安装 ====================
+def _run_pip_install(package: str, use_mirror: bool = False) -> bool:
+    """运行 pip install 命令
+
+    Args:
+        package: 包名
+        use_mirror: 是否使用国内镜像
+
+    Returns:
+        是否安装成功
+    """
+    cmd = [sys.executable, '-m', 'pip', 'install', package]
+    if use_mirror:
+        cmd.extend(['-i', 'https://pypi.tuna.tsinghua.edu.cn/simple'])
+
+    try:
+        debug_logger.log_info(f"[DrissionCaptcha] 正在安装 {package}...")
+        print(f"[DrissionCaptcha] 正在安装 {package}...")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode == 0:
+            debug_logger.log_info(f"[DrissionCaptcha] ✅ {package} 安装成功")
+            print(f"[DrissionCaptcha] ✅ {package} 安装成功")
+            return True
+        else:
+            debug_logger.log_warning(f"[DrissionCaptcha] {package} 安装失败: {result.stderr[:200]}")
+            return False
+    except Exception as e:
+        debug_logger.log_warning(f"[DrissionCaptcha] {package} 安装异常: {e}")
+        return False
+
+
+def _ensure_drissionpage_installed() -> bool:
+    """确保 DrissionPage 已安装
+
+    Returns:
+        是否安装成功/已安装
+    """
+    try:
+        import DrissionPage
+        debug_logger.log_info("[DrissionCaptcha] DrissionPage 已安装")
+        return True
+    except ImportError:
+        pass
+
+    debug_logger.log_info("[DrissionCaptcha] DrissionPage 未安装，开始自动安装...")
+    print("[DrissionCaptcha] DrissionPage 未安装，开始自动安装...")
+
+    # 先尝试官方源
+    if _run_pip_install('DrissionPage', use_mirror=False):
+        return True
+
+    # 官方源失败，尝试国内镜像
+    debug_logger.log_info("[DrissionCaptcha] 官方源安装失败，尝试国内镜像...")
+    print("[DrissionCaptcha] 官方源安装失败，尝试国内镜像...")
+    if _run_pip_install('DrissionPage', use_mirror=True):
+        return True
+
+    debug_logger.log_error("[DrissionCaptcha] ❌ DrissionPage 自动安装失败，请手动安装: pip install DrissionPage")
+    print("[DrissionCaptcha] ❌ DrissionPage 自动安装失败，请手动安装: pip install DrissionPage")
+    return False
+
+
+# 尝试导入 DrissionPage
+ChromiumPage = None
+DRISSIONPAGE_AVAILABLE = False
+
+if IS_DOCKER:
+    debug_logger.log_warning("[DrissionCaptcha] 检测到 Docker 环境，内置浏览器打码不可用，请使用第三方打码服务")
+    print("[DrissionCaptcha] ⚠️ 检测到 Docker 环境，内置浏览器打码不可用")
+    print("[DrissionCaptcha] 请使用第三方打码服务: yescaptcha, capmonster, ezcaptcha, capsolver")
+else:
+    if _ensure_drissionpage_installed():
+        try:
+            from DrissionPage import ChromiumPage
+            # Tab 是 ChromiumPage.new_tab() 返回的对象，不需要单独导入
+            DRISSIONPAGE_AVAILABLE = True
+        except ImportError as e:
+            debug_logger.log_error(f"[DrissionCaptcha] DrissionPage 导入失败: {e}")
+            print(f"[DrissionCaptcha] ❌ DrissionPage 导入失败: {e}")
+
+
+# ==================== 线程池用于同步调用 ====================
+_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="drission_")
+
+
+def _run_in_thread(func, *args, **kwargs):
+    """在线程池中运行同步函数"""
+    loop = asyncio.get_running_loop()
+    return loop.run_in_executor(_executor, func, *args, **kwargs)
+
+
+# ==================== 心跳配置 ====================
+HEARTBEAT_INTERVAL = 600  # 10分钟 = 600秒
+TELEGRAM_API_URL = "http://localhost:5678/telegram/send"
+
+
+class ResidentTabInfo:
+    """常驻标签页信息结构"""
+    def __init__(self, tab, project_id: str):
+        self.tab = tab
+        self.project_id = project_id
+        self.recaptcha_ready = False
+        self.created_at = time.time()
+
+
+class DrissionCaptchaService:
+    """DrissionPage 浏览器自动化获取 reCAPTCHA token
+
+    支持两种模式：
+    1. 常驻模式 (Resident Mode): 为每个 project_id 保持常驻标签页，即时生成 token
+    2. 传统模式 (Legacy Mode): 每次请求创建新标签页 (fallback)
+    """
+
+    _instance: Optional['DrissionCaptchaService'] = None
+    _lock = asyncio.Lock()
+
+    def __init__(self, db=None):
+        """初始化服务"""
+        self.browser: Optional[ChromiumPage] = None
+        self._initialized = False
+        self.website_key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
+        self.db = db
+        # 持久化 profile 目录（与 nodriver 使用不同的目录）
+        self.user_data_dir = os.path.join(os.getcwd(), "browser_data_drission")
+        # Cookies 持久化文件（解决 macOS 上 Chrome 不保存 cookies 的问题）
+        self.cookies_file = os.path.join(os.getcwd(), "browser_data_drission", "saved_cookies.json")
+
+        # 常驻模式相关属性 (支持多 project_id)
+        self._resident_tabs: dict[str, 'ResidentTabInfo'] = {}  # project_id -> 常驻标签页信息
+        self._resident_lock = asyncio.Lock()  # 保护常驻标签页操作
+
+        # 兼容旧 API（保留 single resident 属性作为别名）
+        self.resident_project_id: Optional[str] = None  # 向后兼容
+        self.resident_tab = None                         # 向后兼容
+        self._running = False                            # 向后兼容
+        self._recaptcha_ready = False                    # 向后兼容
+
+        # 心跳任务
+        self._heartbeat_task: Optional[asyncio.Task] = None
+
+    @classmethod
+    async def get_instance(cls, db=None) -> 'DrissionCaptchaService':
+        """获取单例实例"""
+        if cls._instance is None:
+            async with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls(db)
+        return cls._instance
+
+    def _check_available(self):
+        """检查服务是否可用"""
+        if IS_DOCKER:
+            raise RuntimeError(
+                "内置浏览器打码在 Docker 环境中不可用。"
+                "请使用第三方打码服务: yescaptcha, capmonster, ezcaptcha, capsolver"
+            )
+        if not DRISSIONPAGE_AVAILABLE or ChromiumPage is None:
+            raise RuntimeError(
+                "DrissionPage 未安装或不可用。"
+                "请手动安装: pip install DrissionPage"
+            )
+
+    # ==================== 同步方法（在线程池中运行）====================
+
+    def _sync_create_browser(self):
+        """同步创建浏览器实例"""
+        from DrissionPage import ChromiumOptions
+
+        # 确保 user_data_dir 存在
+        os.makedirs(self.user_data_dir, exist_ok=True)
+
+        # 配置浏览器选项
+        co = ChromiumOptions()
+        # 不使用 auto_port，手动设置本地端口以避免临时目录
+        co.set_local_port(9222)
+        # 设置用户数据目录（使用 DrissionPage 的专用方法）
+        co.set_user_data_path(self.user_data_dir)
+        # 只使用最基本的参数
+        co.set_argument('--window-size=1280,720')
+
+        # 配置代理（如果启用）
+        proxy_url = self._get_proxy_url()
+        if proxy_url:
+            co.set_proxy(proxy_url)
+            debug_logger.log_info(f"[DrissionCaptcha] 使用代理: {proxy_url}")
+
+        debug_logger.log_info(f"[DrissionCaptcha] 正在启动 DrissionPage 浏览器 (用户数据目录: {self.user_data_dir})...")
+
+        # 创建浏览器
+        browser = ChromiumPage(addr_or_opts=co)
+        self.browser = browser  # 临时设置，用于加载 cookies
+
+        # 尝试从文件加载 cookies
+        self._sync_load_cookies()
+
+        debug_logger.log_info(f"[DrissionCaptcha] ✅ DrissionPage 浏览器已启动 (Profile: {self.user_data_dir})")
+        return browser
+
+    def _get_proxy_url(self) -> Optional[str]:
+        """获取代理 URL（从数据库配置）"""
+        if self.db is None:
+            return None
+        try:
+            # 同步获取代理配置 - 直接从数据库读取
+            import sqlite3
+            db_path = os.path.join(os.getcwd(), "data", "flow.db")
+            if not os.path.exists(db_path):
+                return None
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT browser_proxy_enabled, browser_proxy_url FROM captcha_config WHERE id = 1")
+            row = cursor.fetchone()
+            conn.close()
+            if row and row[0] and row[1]:  # browser_proxy_enabled and browser_proxy_url
+                return row[1]
+        except Exception as e:
+            debug_logger.log_warning(f"[DrissionCaptcha] 获取代理配置失败: {e}")
+        return None
+
+    def _sync_check_browser_alive(self):
+        """同步检查浏览器是否存活"""
+        if self.browser is None:
+            return False
+        try:
+            # 尝试访问 url 属性来检查浏览器是否存活
+            _ = self.browser.url
+            return True
+        except:
+            return False
+
+    def _sync_new_tab(self, url: str):
+        """同步创建新标签页"""
+        return self.browser.new_tab(url)
+
+    def _sync_get_tab(self, url: str):
+        """同步访问页面（当前标签页）"""
+        self.browser.get(url)
+        return self.browser
+
+    def _sync_close_tab(self, tab):
+        """同步关闭标签页"""
+        try:
+            tab.close()
+        except:
+            pass
+
+    def _sync_save_cookies(self):
+        """保存 cookies 到文件（解决 macOS 上 cookies 不持久化的问题）"""
+        try:
+            if self.browser:
+                import json
+                cookies = self.browser.cookies()
+                os.makedirs(os.path.dirname(self.cookies_file), exist_ok=True)
+                with open(self.cookies_file, 'w') as f:
+                    json.dump(cookies, f)
+                debug_logger.log_info(f"[DrissionCaptcha] 已保存 {len(cookies)} 个 cookies 到文件")
+        except Exception as e:
+            debug_logger.log_warning(f"[DrissionCaptcha] 保存 cookies 失败: {e}")
+
+    def _sync_load_cookies(self):
+        """从文件加载 cookies 并注入浏览器"""
+        try:
+            import json
+            if os.path.exists(self.cookies_file) and self.browser:
+                with open(self.cookies_file, 'r') as f:
+                    cookies = json.load(f)
+                # 先访问目标域名，然后注入 cookies
+                for cookie in cookies:
+                    try:
+                        self.browser.set.cookies(cookie)
+                    except:
+                        pass
+                debug_logger.log_info(f"[DrissionCaptcha] 已从文件加载 {len(cookies)} 个 cookies")
+                return True
+        except Exception as e:
+            debug_logger.log_warning(f"[DrissionCaptcha] 加载 cookies 失败: {e}")
+        return False
+
+    def _sync_close_browser(self):
+        """同步关闭浏览器"""
+        try:
+            if self.browser:
+                # 关闭前保存 cookies
+                self._sync_save_cookies()
+                self.browser.quit()
+        except:
+            pass
+
+    def _sync_reload_tab(self, tab):
+        """同步刷新标签页"""
+        tab.refresh()
+
+    def _sync_heartbeat_js(self, tab) -> bool:
+        """同步执行心跳 JS，返回是否成功"""
+        try:
+            tab.run_js("Date.now()")
+            return True
+        except:
+            return False
+
+    def _sync_get_cookies(self):
+        """同步获取所有 cookies"""
+        return self.browser.cookies(as_dict=True)
+
+    # ==================== 心跳机制 ====================
+
+    async def _heartbeat_loop(self):
+        """后台心跳循环，每 10 分钟执行一次轻量 JS 保持 Chrome 活跃"""
+        debug_logger.log_info(f"[DrissionCaptcha] 心跳任务已启动（间隔 {HEARTBEAT_INTERVAL} 秒）")
+
+        while True:
+            try:
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+                # 检查浏览器是否存活
+                is_alive = await _run_in_thread(self._sync_check_browser_alive)
+
+                if not is_alive:
+                    debug_logger.log_error("[DrissionCaptcha] ❌ Chrome 浏览器已停止运行！")
+                    await self._send_telegram_alert("⚠️ flow2api: Chrome 浏览器已停止运行，需要重启服务")
+                    # 标记未初始化，下次调用会重新启动
+                    self._initialized = False
+                    self.browser = None
+                    break
+
+                # 在主浏览器上执行心跳 JS
+                heartbeat_success = await _run_in_thread(self._sync_check_browser_alive)
+
+                if heartbeat_success:
+                    debug_logger.log_info(f"[DrissionCaptcha] ♥ 心跳成功（常驻标签页: {len(self._resident_tabs)} 个）")
+                else:
+                    debug_logger.log_warning("[DrissionCaptcha] 心跳检测失败，浏览器可能已停止")
+                    await self._send_telegram_alert("⚠️ flow2api: Chrome 心跳检测失败，浏览器可能已停止")
+
+            except asyncio.CancelledError:
+                debug_logger.log_info("[DrissionCaptcha] 心跳任务被取消")
+                break
+            except Exception as e:
+                debug_logger.log_error(f"[DrissionCaptcha] 心跳循环异常: {e}")
+                await self._send_telegram_alert(f"⚠️ flow2api: Chrome 心跳检测异常: {e}")
+
+    async def _send_telegram_alert(self, message: str):
+        """发送 Telegram 告警"""
+        try:
+            import urllib.request
+            import json
+
+            data = json.dumps({"text": message}).encode('utf-8')
+            req = urllib.request.Request(
+                TELEGRAM_API_URL,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method='POST'
+            )
+
+            # 使用线程池执行同步 HTTP 请求，避免阻塞
+            def do_request():
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        return resp.status
+                except Exception as e:
+                    return str(e)
+
+            result = await _run_in_thread(do_request)
+
+            if result == 200:
+                debug_logger.log_info(f"[DrissionCaptcha] Telegram 告警已发送: {message}")
+            else:
+                debug_logger.log_warning(f"[DrissionCaptcha] Telegram 告警发送失败: {result}")
+
+        except Exception as e:
+            debug_logger.log_error(f"[DrissionCaptcha] Telegram 告警发送异常: {e}")
+
+    def _start_heartbeat(self):
+        """启动心跳任务"""
+        if self._heartbeat_task is None or self._heartbeat_task.done():
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            debug_logger.log_info("[DrissionCaptcha] 心跳任务已调度")
+
+    def _stop_heartbeat(self):
+        """停止心跳任务"""
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
+            debug_logger.log_info("[DrissionCaptcha] 心跳任务已停止")
+
+    # ==================== 异步 API ====================
+
+    async def initialize(self):
+        """初始化 DrissionPage 浏览器"""
+        # 检查服务是否可用
+        self._check_available()
+
+        if self._initialized and self.browser:
+            # 检查浏览器是否仍然存活
+            is_alive = await _run_in_thread(self._sync_check_browser_alive)
+            if is_alive:
+                return
+            else:
+                debug_logger.log_warning("[DrissionCaptcha] 浏览器已停止，重新初始化...")
+                self._initialized = False
+
+        try:
+            debug_logger.log_info("[DrissionCaptcha] 开始在线程池中创建浏览器...")
+            # 在线程池中创建浏览器
+            self.browser = await _run_in_thread(self._sync_create_browser)
+            self._initialized = True
+            debug_logger.log_info("[DrissionCaptcha] 浏览器创建完成，已设置 _initialized=True")
+
+            # 启动心跳任务
+            self._start_heartbeat()
+        except Exception as e:
+            debug_logger.log_error(f"[DrissionCaptcha] ❌ 浏览器启动失败: {str(e)}")
+            raise
+
+    async def start_resident_mode(self, project_id: str):
+        """启动常驻模式
+
+        Args:
+            project_id: 用于常驻的项目 ID
+        """
+        if self._running:
+            debug_logger.log_warning("[DrissionCaptcha] 常驻模式已在运行")
+            return
+
+        await self.initialize()
+
+        self.resident_project_id = project_id
+        website_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
+
+        debug_logger.log_info(f"[DrissionCaptcha] 启动常驻模式，访问页面: {website_url}")
+
+        # 直接在主窗口访问页面（使用 browser.get 比 new_tab 更稳定）
+        self.resident_tab = await _run_in_thread(self._sync_get_tab, website_url)
+
+        debug_logger.log_info("[DrissionCaptcha] 标签页已创建，等待页面加载...")
+
+        # 等待页面加载完成
+        page_loaded = await self._wait_page_load(self.resident_tab, timeout=60)
+
+        if not page_loaded:
+            debug_logger.log_error("[DrissionCaptcha] 页面加载超时，常驻模式启动失败")
+            return
+
+        # 等待 reCAPTCHA 加载
+        self._recaptcha_ready = await self._wait_for_recaptcha(self.resident_tab)
+
+        if not self._recaptcha_ready:
+            debug_logger.log_error("[DrissionCaptcha] reCAPTCHA 加载失败，常驻模式启动失败")
+            return
+
+        # 将当前标签页加入 _resident_tabs，以便 get_token() 能找到并复用
+        resident_info = ResidentTabInfo(self.resident_tab, project_id)
+        resident_info.recaptcha_ready = True
+        self._resident_tabs[project_id] = resident_info
+
+        self._running = True
+        debug_logger.log_info(f"[DrissionCaptcha] ✅ 常驻模式已启动 (project: {project_id})")
+
+    async def stop_resident_mode(self, project_id: Optional[str] = None):
+        """停止常驻模式
+
+        Args:
+            project_id: 指定要关闭的 project_id，如果为 None 则关闭所有常驻标签页
+        """
+        async with self._resident_lock:
+            if project_id:
+                # 关闭指定的常驻标签页
+                await self._close_resident_tab(project_id)
+                debug_logger.log_info(f"[DrissionCaptcha] 已关闭 project_id={project_id} 的常驻模式")
+            else:
+                # 关闭所有常驻标签页
+                project_ids = list(self._resident_tabs.keys())
+                for pid in project_ids:
+                    resident_info = self._resident_tabs.pop(pid, None)
+                    if resident_info and resident_info.tab:
+                        await _run_in_thread(self._sync_close_tab, resident_info.tab)
+                debug_logger.log_info(f"[DrissionCaptcha] 已关闭所有常驻标签页 (共 {len(project_ids)} 个)")
+
+        # 向后兼容：清理旧属性
+        if not self._running:
+            return
+
+        self._running = False
+        if self.resident_tab:
+            await _run_in_thread(self._sync_close_tab, self.resident_tab)
+            self.resident_tab = None
+
+        self.resident_project_id = None
+        self._recaptcha_ready = False
+
+    async def _wait_page_load(self, tab, timeout: int = 60) -> bool:
+        """等待页面加载完成
+
+        Args:
+            tab: DrissionPage 标签页对象
+            timeout: 超时时间（秒）
+
+        Returns:
+            True if 页面加载成功
+        """
+        for retry in range(timeout):
+            try:
+                await asyncio.sleep(1)
+                # 使用 url 属性检查页面是否已加载（比 run_js 更稳定）
+                current_url = await _run_in_thread(lambda: tab.url if hasattr(tab, 'url') else '')
+                debug_logger.log_info(f"[DrissionCaptcha] 当前 URL: {current_url} (重试 {retry + 1}/{timeout})")
+                # 如果 URL 包含目标域名，认为页面已加载
+                if current_url and ('labs.google' in current_url or 'flow/project' in current_url):
+                    return True
+            except Exception as e:
+                debug_logger.log_warning(f"[DrissionCaptcha] 等待页面异常: {e}，重试 {retry + 1}/{timeout}...")
+                await asyncio.sleep(1)
+
+        return False
+
+    async def _wait_for_recaptcha(self, tab) -> bool:
+        """等待 reCAPTCHA 加载
+
+        Args:
+            tab: DrissionPage 标签页对象
+
+        Returns:
+            True if reCAPTCHA loaded successfully
+        """
+        debug_logger.log_info("[DrissionCaptcha] 等待页面和 reCAPTCHA 加载...")
+
+        # 简单等待一段时间，让页面自己加载 reCAPTCHA
+        # Google Flow 页面会自动加载 reCAPTCHA
+        await asyncio.sleep(5)
+
+        # 不再使用 run_js 检测，直接返回 True
+        # 在实际调用 execute 时会检测 reCAPTCHA 是否可用
+        debug_logger.log_info("[DrissionCaptcha] 页面已加载，假定 reCAPTCHA 可用")
+        return True
+
+    async def _execute_recaptcha_on_tab(self, tab, action: str = "IMAGE_GENERATION") -> Optional[str]:
+        """在指定标签页执行 reCAPTCHA 获取 token
+
+        Args:
+            tab: DrissionPage 标签页对象
+            action: reCAPTCHA action类型 (IMAGE_GENERATION 或 VIDEO_GENERATION)
+
+        Returns:
+            reCAPTCHA token 或 None
+        """
+        debug_logger.log_info(f"[DrissionCaptcha] 开始执行 reCAPTCHA (action: {action})...")
+
+        # 先检查 grecaptcha 是否存在 (需要加 return 才能获取返回值)
+        check_script = "return typeof grecaptcha !== 'undefined' && typeof grecaptcha.enterprise !== 'undefined'"
+        has_recaptcha = await _run_in_thread(lambda: tab.run_js(check_script))
+        debug_logger.log_info(f"[DrissionCaptcha] reCAPTCHA 检查结果: {has_recaptcha}")
+
+        if not has_recaptcha:
+            debug_logger.log_error(f"[DrissionCaptcha] 页面没有 reCAPTCHA")
+            return None
+
+        # DrissionPage run_js 不支持 async/await 返回值，使用全局变量方式
+        ts = int(time.time() * 1000)
+        token_var = f"_recaptcha_token_{ts}"
+        status_var = f"_recaptcha_status_{ts}"
+
+        # 注入脚本 - 使用标准回调方式
+        script = f"""
+        (function() {{
+            window.{token_var} = null;
+            window.{status_var} = 'waiting';
+
+            if (typeof grecaptcha === 'undefined' || typeof grecaptcha.enterprise === 'undefined') {{
+                window.{status_var} = 'error:grecaptcha not defined';
+                return;
+            }}
+
+            grecaptcha.enterprise.ready(function() {{
+                grecaptcha.enterprise.execute('{self.website_key}', {{action: '{action}'}})
+                    .then(function(token) {{
+                        window.{token_var} = token;
+                        window.{status_var} = 'success';
+                    }})
+                    .catch(function(err) {{
+                        window.{status_var} = 'error:' + (err.message || 'unknown');
+                    }});
+            }});
+        }})()
+        """
+
+        # 执行注入脚本
+        inject_result = await _run_in_thread(lambda: tab.run_js(script))
+        debug_logger.log_info(f"[DrissionCaptcha] 注入脚本结果: {inject_result}")
+
+        # 轮询等待结果（最多 20 秒）
+        for i in range(40):
+            await asyncio.sleep(0.5)
+
+            # 检查状态 - 需要加 return 才能获取返回值
+            try:
+                status = await _run_in_thread(lambda: tab.run_js(f"return window.{status_var}"))
+                if status is None:
+                    status = await _run_in_thread(lambda: tab.run_js(f"return typeof window.{status_var} !== 'undefined' ? window.{status_var} : 'undefined'"))
+            except:
+                status = 'error:read_failed'
+
+            debug_logger.log_info(f"[DrissionCaptcha] 状态检查 (重试 {i+1}/40): {status}")
+
+            if status == 'success':
+                # 获取 token - 需要加 return
+                token = await _run_in_thread(lambda: tab.run_js(f"return window.{token_var}"))
+                if token and (token.startswith('03') or len(token) > 500):
+                    debug_logger.log_info(f"[DrissionCaptcha] ✅ Token 获取成功，长度: {len(token)}")
+                    return token
+
+            if status and isinstance(status, str) and status.startswith('error:'):
+                debug_logger.log_error(f"[DrissionCaptcha] 错误: {status}")
+                return None
+
+        debug_logger.log_error(f"[DrissionCaptcha] 获取 token 超时")
+        return None
+
+    # ==================== 主要 API ====================
+
+    async def get_token(self, project_id: str, action: str = "IMAGE_GENERATION") -> Optional[str]:
+        """获取 reCAPTCHA token
+
+        自动常驻模式：复用常驻标签页，直接执行 JS 获取 token，无需刷新页面
+
+        Args:
+            project_id: Flow项目ID
+            action: reCAPTCHA action类型
+                - IMAGE_GENERATION: 图片生成和2K/4K图片放大 (默认)
+                - VIDEO_GENERATION: 视频生成和视频放大
+
+        Returns:
+            reCAPTCHA token字符串，如果获取失败返回None
+        """
+        # 确保浏览器已初始化
+        await self.initialize()
+
+        # 尝试从常驻标签页获取 token
+        async with self._resident_lock:
+            resident_info = self._resident_tabs.get(project_id)
+
+            # 如果该 project_id 没有常驻标签页，则自动创建
+            if resident_info is None:
+                debug_logger.log_info(f"[DrissionCaptcha] project_id={project_id} 没有常驻标签页，正在创建...")
+                resident_info = await self._create_resident_tab(project_id)
+                if resident_info is None:
+                    debug_logger.log_warning(f"[DrissionCaptcha] 无法创建常驻标签页，fallback 到传统模式")
+                    return await self._get_token_legacy(project_id, action)
+                self._resident_tabs[project_id] = resident_info
+
+        # 使用常驻标签页直接执行 JS 获取 token（不刷新页面）
+        if resident_info and resident_info.recaptcha_ready and resident_info.tab:
+            start_time = time.time()
+            debug_logger.log_info(f"[DrissionCaptcha] 从常驻标签页即时生成 token (action: {action})...")
+            try:
+                token = await self._execute_recaptcha_on_tab(resident_info.tab, action)
+                duration_ms = (time.time() - start_time) * 1000
+                if token:
+                    debug_logger.log_info(f"[DrissionCaptcha] ✅ Token生成成功（耗时 {duration_ms:.0f}ms）")
+                    return token
+                else:
+                    debug_logger.log_warning(f"[DrissionCaptcha] 常驻标签页生成失败，尝试重建...")
+            except Exception as e:
+                debug_logger.log_warning(f"[DrissionCaptcha] 常驻标签页异常: {e}，尝试重建...")
+
+            # 常驻标签页失效，尝试重建
+            async with self._resident_lock:
+                await self._close_resident_tab(project_id)
+                resident_info = await self._create_resident_tab(project_id)
+                if resident_info:
+                    self._resident_tabs[project_id] = resident_info
+                    try:
+                        token = await self._execute_recaptcha_on_tab(resident_info.tab, action)
+                        if token:
+                            debug_logger.log_info(f"[DrissionCaptcha] ✅ 重建后 Token生成成功")
+                            return token
+                    except Exception:
+                        pass
+
+        # 最终 Fallback: 使用传统模式（刷新页面）
+        debug_logger.log_warning(f"[DrissionCaptcha] 所有常驻方式失败，fallback 到传统模式")
+        return await self._get_token_legacy(project_id, action)
+
+    async def _get_token_legacy(self, project_id: str, action: str = "IMAGE_GENERATION") -> Optional[str]:
+        """传统模式获取 token（刷新页面，作为 fallback）"""
+        website_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
+        debug_logger.log_info(f"[DrissionCaptcha] [Legacy] 访问页面获取 token: {website_url}")
+
+        await _run_in_thread(lambda: self.browser.get(website_url))
+
+        # 等待页面加载完成
+        for i in range(30):
+            await asyncio.sleep(1)
+            url = await _run_in_thread(lambda: self.browser.url)
+            if url and ('labs.google' in url or 'flow/project' in url):
+                break
+
+        # 等待 reCAPTCHA 脚本加载
+        await asyncio.sleep(5)
+
+        token = await self._execute_recaptcha_on_tab(self.browser, action)
+        if token:
+            debug_logger.log_info(f"[DrissionCaptcha] [Legacy] ✅ Token 获取成功")
+        else:
+            debug_logger.log_error(f"[DrissionCaptcha] [Legacy] ❌ Token 获取失败")
+        return token
+
+    async def _create_resident_tab(self, project_id: str) -> Optional[ResidentTabInfo]:
+        """为指定 project_id 创建常驻标签页
+
+        Args:
+            project_id: 项目 ID
+
+        Returns:
+            ResidentTabInfo 对象，或 None（创建失败）
+        """
+        try:
+            website_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
+            debug_logger.log_info(f"[DrissionCaptcha] 为 project_id={project_id} 创建常驻标签页，访问: {website_url}")
+
+            # 创建新标签页
+            tab = await _run_in_thread(self._sync_new_tab, website_url)
+
+            # 等待页面加载完成
+            page_loaded = await self._wait_page_load(tab, timeout=60)
+
+            if not page_loaded:
+                debug_logger.log_error(f"[DrissionCaptcha] 页面加载超时 (project: {project_id})")
+                await _run_in_thread(self._sync_close_tab, tab)
+                return None
+
+            # 等待 reCAPTCHA 加载
+            recaptcha_ready = await self._wait_for_recaptcha(tab)
+
+            if not recaptcha_ready:
+                debug_logger.log_error(f"[DrissionCaptcha] reCAPTCHA 加载失败 (project: {project_id})")
+                await _run_in_thread(self._sync_close_tab, tab)
+                return None
+
+            # 创建常驻信息对象
+            resident_info = ResidentTabInfo(tab, project_id)
+            resident_info.recaptcha_ready = True
+
+            debug_logger.log_info(f"[DrissionCaptcha] ✅ 常驻标签页创建成功 (project: {project_id})")
+            return resident_info
+
+        except Exception as e:
+            debug_logger.log_error(f"[DrissionCaptcha] 创建常驻标签页异常: {e}")
+            return None
+
+    async def _close_resident_tab(self, project_id: str):
+        """关闭指定 project_id 的常驻标签页
+
+        Args:
+            project_id: 项目 ID
+        """
+        resident_info = self._resident_tabs.pop(project_id, None)
+        if resident_info and resident_info.tab:
+            await _run_in_thread(self._sync_close_tab, resident_info.tab)
+            debug_logger.log_info(f"[DrissionCaptcha] 已关闭 project_id={project_id} 的常驻标签页")
+
+    async def _get_token_legacy(self, project_id: str, action: str = "IMAGE_GENERATION") -> Optional[str]:
+        """传统模式获取 reCAPTCHA token（每次创建新标签页）
+
+        Args:
+            project_id: Flow项目ID
+            action: reCAPTCHA action类型 (IMAGE_GENERATION 或 VIDEO_GENERATION)
+
+        Returns:
+            reCAPTCHA token字符串，如果获取失败返回None
+        """
+        # 确保浏览器已启动
+        if not self._initialized or not self.browser:
+            await self.initialize()
+
+        start_time = time.time()
+        tab = None
+
+        try:
+            website_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
+            debug_logger.log_info(f"[DrissionCaptcha] [Legacy] 访问页面: {website_url}")
+
+            # 新建标签页并访问页面
+            tab = await _run_in_thread(self._sync_new_tab, website_url)
+
+            # 等待页面完全加载
+            debug_logger.log_info("[DrissionCaptcha] [Legacy] 等待页面加载...")
+            await asyncio.sleep(3)
+
+            # 等待页面 DOM 完成
+            page_loaded = await self._wait_page_load(tab, timeout=10)
+            if not page_loaded:
+                debug_logger.log_error("[DrissionCaptcha] [Legacy] 页面加载超时")
+                return None
+
+            # 等待 reCAPTCHA 加载
+            recaptcha_ready = await self._wait_for_recaptcha(tab)
+
+            if not recaptcha_ready:
+                debug_logger.log_error("[DrissionCaptcha] [Legacy] reCAPTCHA 无法加载")
+                return None
+
+            # 执行 reCAPTCHA
+            debug_logger.log_info(f"[DrissionCaptcha] [Legacy] 执行 reCAPTCHA 验证 (action: {action})...")
+            token = await self._execute_recaptcha_on_tab(tab, action)
+
+            duration_ms = (time.time() - start_time) * 1000
+
+            if token:
+                debug_logger.log_info(f"[DrissionCaptcha] [Legacy] ✅ Token获取成功（耗时 {duration_ms:.0f}ms）")
+                return token
+            else:
+                debug_logger.log_error("[DrissionCaptcha] [Legacy] Token获取失败（返回null）")
+                return None
+
+        except Exception as e:
+            debug_logger.log_error(f"[DrissionCaptcha] [Legacy] 获取token异常: {str(e)}")
+            return None
+        finally:
+            # 关闭标签页（但保留浏览器）
+            if tab:
+                await _run_in_thread(self._sync_close_tab, tab)
+
+    async def close(self):
+        """关闭浏览器"""
+        # 停止心跳任务
+        self._stop_heartbeat()
+
+        # 先停止所有常驻模式（关闭所有常驻标签页）
+        await self.stop_resident_mode()
+
+        try:
+            if self.browser:
+                await _run_in_thread(self._sync_close_browser)
+                self.browser = None
+
+            self._initialized = False
+            self._resident_tabs.clear()  # 确保清空常驻字典
+            debug_logger.log_info("[DrissionCaptcha] 浏览器已关闭")
+        except Exception as e:
+            debug_logger.log_error(f"[DrissionCaptcha] 关闭浏览器异常: {str(e)}")
+
+    async def open_login_window(self):
+        """打开登录窗口供用户手动登录 Google"""
+        await self.initialize()
+        await _run_in_thread(lambda: self.browser.get("https://accounts.google.com/"))
+        debug_logger.log_info("[DrissionCaptcha] 请在打开的浏览器中登录账号。登录完成后，无需关闭浏览器，脚本下次运行时会自动使用此状态。")
+        print("请在打开的浏览器中登录账号。登录完成后，无需关闭浏览器，脚本下次运行时会自动使用此状态。")
+
+    # ==================== Session Token 刷新 ====================
+
+    async def refresh_session_token(self, project_id: str) -> Optional[str]:
+        """从常驻标签页获取最新的 Session Token
+
+        复用 reCAPTCHA 常驻标签页，通过刷新页面并从 cookies 中提取
+        __Secure-next-auth.session-token
+
+        Args:
+            project_id: 项目ID，用于定位常驻标签页
+
+        Returns:
+            新的 Session Token，如果获取失败返回 None
+        """
+        # 确保浏览器已初始化
+        await self.initialize()
+
+        start_time = time.time()
+        debug_logger.log_info(f"[DrissionCaptcha] 开始刷新 Session Token (project: {project_id})...")
+
+        # 尝试获取或创建常驻标签页
+        async with self._resident_lock:
+            resident_info = self._resident_tabs.get(project_id)
+
+            # 如果该 project_id 没有常驻标签页，则创建
+            if resident_info is None:
+                debug_logger.log_info(f"[DrissionCaptcha] project_id={project_id} 没有常驻标签页，正在创建...")
+                resident_info = await self._create_resident_tab(project_id)
+                if resident_info is None:
+                    debug_logger.log_warning(f"[DrissionCaptcha] 无法为 project_id={project_id} 创建常驻标签页")
+                    return None
+                self._resident_tabs[project_id] = resident_info
+
+        if not resident_info or not resident_info.tab:
+            debug_logger.log_error(f"[DrissionCaptcha] 无法获取常驻标签页")
+            return None
+
+        tab = resident_info.tab
+
+        try:
+            # 刷新页面以获取最新的 cookies
+            debug_logger.log_info(f"[DrissionCaptcha] 刷新常驻标签页以获取最新 cookies...")
+            await _run_in_thread(self._sync_reload_tab, tab)
+
+            # 等待页面加载完成
+            page_loaded = await self._wait_page_load(tab, timeout=30)
+            if not page_loaded:
+                debug_logger.log_error("[DrissionCaptcha] 刷新页面加载超时")
+                return None
+
+            # 额外等待确保 cookies 已设置
+            await asyncio.sleep(2)
+
+            # 从 cookies 中提取 __Secure-next-auth.session-token
+            session_token = None
+
+            try:
+                # 使用 DrissionPage 的 cookies API
+                cookies = await _run_in_thread(self._sync_get_cookies)
+
+                # cookies 返回的是字典，需要查找
+                for cookie_name, cookie_value in cookies.items():
+                    if cookie_name == "__Secure-next-auth.session-token":
+                        session_token = cookie_value
+                        break
+
+                # DrissionPage 的 cookies(as_dict=True) 返回格式可能是 {name: value}
+                if not session_token and isinstance(cookies, dict):
+                    # 尝试直接从字典获取
+                    session_token = cookies.get("__Secure-next-auth.session-token")
+
+            except Exception as e:
+                debug_logger.log_warning(f"[DrissionCaptcha] 通过 cookies API 获取失败: {e}，尝试从 document.cookie 获取...")
+
+                # 备选方案：通过 JavaScript 获取 - 需要加 return
+                try:
+                    all_cookies = await _run_in_thread(lambda: tab.run_js("return document.cookie"))
+                    if all_cookies:
+                        for part in all_cookies.split(";"):
+                            part = part.strip()
+                            if part.startswith("__Secure-next-auth.session-token="):
+                                session_token = part.split("=", 1)[1]
+                                break
+                except Exception as e2:
+                    debug_logger.log_error(f"[DrissionCaptcha] document.cookie 获取失败: {e2}")
+
+            duration_ms = (time.time() - start_time) * 1000
+
+            if session_token:
+                debug_logger.log_info(f"[DrissionCaptcha] ✅ Session Token 获取成功（耗时 {duration_ms:.0f}ms）")
+                return session_token
+            else:
+                debug_logger.log_error(f"[DrissionCaptcha] ❌ 未找到 __Secure-next-auth.session-token cookie")
+                return None
+
+        except Exception as e:
+            debug_logger.log_error(f"[DrissionCaptcha] 刷新 Session Token 异常: {str(e)}")
+
+            # 常驻标签页可能已失效，尝试重建
+            async with self._resident_lock:
+                await self._close_resident_tab(project_id)
+                resident_info = await self._create_resident_tab(project_id)
+                if resident_info:
+                    self._resident_tabs[project_id] = resident_info
+                    # 重建后再次尝试获取
+                    try:
+                        cookies = await _run_in_thread(self._sync_get_cookies)
+                        if isinstance(cookies, dict):
+                            session_token = cookies.get("__Secure-next-auth.session-token")
+                            if session_token:
+                                debug_logger.log_info(f"[DrissionCaptcha] ✅ 重建后 Session Token 获取成功")
+                                return session_token
+                    except Exception:
+                        pass
+
+            return None
+
+    # ==================== 状态查询 ====================
+
+    def is_resident_mode_active(self) -> bool:
+        """检查是否有任何常驻标签页激活"""
+        return len(self._resident_tabs) > 0 or self._running
+
+    def get_resident_count(self) -> int:
+        """获取当前常驻标签页数量"""
+        return len(self._resident_tabs)
+
+    def get_resident_project_ids(self) -> list[str]:
+        """获取所有当前常驻的 project_id 列表"""
+        return list(self._resident_tabs.keys())
+
+    def get_resident_project_id(self) -> Optional[str]:
+        """获取当前常驻的 project_id（向后兼容，返回第一个）"""
+        if self._resident_tabs:
+            return next(iter(self._resident_tabs.keys()))
+        return self.resident_project_id
