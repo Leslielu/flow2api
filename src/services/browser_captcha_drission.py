@@ -277,6 +277,10 @@ class DrissionCaptchaService:
         self.browser.get(url)
         return self.browser
 
+    def _sync_tab_get(self, tab, url: str):
+        """同步在指定标签页上访问页面"""
+        tab.get(url)
+
     def _sync_close_tab(self, tab):
         """同步关闭标签页"""
         try:
@@ -861,6 +865,11 @@ class DrissionCaptchaService:
     async def _create_resident_tab(self, project_id: str) -> Optional[ResidentTabInfo]:
         """为指定 project_id 创建常驻标签页
 
+        模拟真实用户行为，依次访问：
+        1. www.google.com (停留 3 秒)
+        2. https://labs.google/fx/zh/tools/flow (停留 3 秒)
+        3. 最终目标 URL
+
         Args:
             project_id: 项目 ID
 
@@ -869,10 +878,21 @@ class DrissionCaptchaService:
         """
         try:
             website_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
-            debug_logger.log_info(f"[DrissionCaptcha] 为 project_id={project_id} 创建常驻标签页，访问: {website_url}")
+            debug_logger.log_info(f"[DrissionCaptcha] 为 project_id={project_id} 创建常驻标签页")
 
-            # 创建新标签页
-            tab = await _run_in_thread(self._sync_new_tab, website_url)
+            # 创建新标签页（先访问 Google 首页）
+            tab = await _run_in_thread(self._sync_new_tab, "https://www.google.com")
+            await asyncio.sleep(3)
+            debug_logger.log_info("[DrissionCaptcha] ✓ 已访问 www.google.com")
+
+            # 访问 Flow 中文首页
+            await _run_in_thread(self._sync_tab_get, tab, "https://labs.google/fx/zh/tools/flow")
+            await asyncio.sleep(3)
+            debug_logger.log_info("[DrissionCaptcha] ✓ 已访问 labs.google/fx/zh/tools/flow")
+
+            # 最后访问目标 URL
+            debug_logger.log_info(f"[DrissionCaptcha] 正在访问目标 URL: {website_url}")
+            await _run_in_thread(self._sync_tab_get, tab, website_url)
 
             # 等待页面加载完成
             page_loaded = await self._wait_page_load(tab, timeout=60)
