@@ -340,7 +340,7 @@ class DrissionCaptchaService:
 
     def _sync_get_cookies(self):
         """同步获取所有 cookies"""
-        return self.browser.cookies(as_dict=True)
+        return self.browser.cookies()
 
     # ==================== 心跳机制 ====================
 
@@ -397,12 +397,19 @@ class DrissionCaptchaService:
                 debug_logger.log_warning("[DrissionCaptcha] 无法获取 cookies，跳过 Session Token 检查")
                 return
 
-            # 提取 session token
+            # 提取 session token（DrissionPage 返回的是列表，每个元素是字典）
             new_session_token = None
-            for cookie_name, cookie_value in cookies.items():
-                if cookie_name == "__Secure-next-auth.session-token":
-                    new_session_token = cookie_value
-                    break
+            for cookie in cookies:
+                if isinstance(cookie, dict):
+                    if cookie.get('name') == '__Secure-next-auth.session-token':
+                        new_session_token = cookie.get('value')
+                        break
+                else:
+                    # 如果是对象，尝试获取属性
+                    name = getattr(cookie, 'name', None)
+                    if name == '__Secure-next-auth.session-token':
+                        new_session_token = getattr(cookie, 'value', None)
+                        break
 
             if not new_session_token:
                 debug_logger.log_warning("[DrissionCaptcha] 未找到 __Secure-next-auth.session-token cookie")
