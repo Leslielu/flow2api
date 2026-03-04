@@ -368,6 +368,8 @@ class DrissionCaptchaService:
 
                 if heartbeat_success:
                     debug_logger.log_info(f"[DrissionCaptcha] ♥ 心跳成功（常驻标签页: {len(self._resident_tabs)} 个）")
+                    # 心跳成功后，检查并更新 Session Token
+                    await self._check_and_update_session_tokens()
                 else:
                     debug_logger.log_warning("[DrissionCaptcha] 心跳检测失败，浏览器可能已停止")
                     await self._send_telegram_alert("⚠️ flow2api: Chrome 心跳检测失败，浏览器可能已停止")
@@ -378,6 +380,108 @@ class DrissionCaptchaService:
             except Exception as e:
                 debug_logger.log_error(f"[DrissionCaptcha] 心跳循环异常: {e}")
                 await self._send_telegram_alert(f"⚠️ flow2api: Chrome 心跳检测异常: {e}")
+
+    async def _check_and_update_session_tokens(self):
+        """检查并更新 Session Token（心跳时调用）
+
+        遍历所有常驻标签页，获取最新的 __Secure-next-auth.session-token，
+        与数据库中的对比，如果变化则自动更新。
+        """
+        if not self._resident_tabs:
+            return
+
+        try:
+            # 获取所有 cookies
+            cookies = await _run_in_thread(self._sync_get_cookies)
+            if not cookies:
+                debug_logger.log_warning("[DrissionCaptcha] 无法获取 cookies，跳过 Session Token 检查")
+                return
+
+            # 提取 session token
+            new_session_token = None
+            for cookie_name, cookie_value in cookies.items():
+                if cookie_name == "__Secure-next-auth.session-token":
+                    new_session_token = cookie_value
+                    break
+
+            if not new_session_token:
+                debug_logger.log_warning("[DrissionCaptcha] 未找到 __Secure-next-auth.session-token cookie")
+                return
+
+            # 遍历所有常驻标签页，检查对应 token 的 session token 是否需要更新
+            for project_id, resident_info in list(self._resident_tabs.items()):
+                try:
+                    # 从数据库查询该 project_id 对应的 token
+                    token = await self._get_token_by_project_id(project_id)
+                    if not token:
+                        continue
+
+                    # 检查 session token 是否变化
+                    if token.st != new_session_token:
+                        debug_logger.log_info(f"[DrissionCaptcha] Token {token.id} ({token.email}) 的 Session Token 已更新")
+                        await self._update_token_st(token.id, new_session_token)
+
+                except Exception as e:
+                    debug_logger.log_error(f"[DrissionCaptcha] 检查 project_id={project_id} 的 Session Token 失败: {e}")
+
+        except Exception as e:
+            debug_logger.log_error(f"[DrissionCaptcha] 检查 Session Token 异常: {e}")
+
+    async def _get_token_by_project_id(self, project_id: str):
+        """根据 project_id 查询对应的 Token
+
+        Args:
+            project_id: 项目 UUID
+
+        Returns:
+            Token 对象，如果未找到返回 None
+        """
+        try:
+            import sqlite3
+            db_path = os.path.join(os.getcwd(), "data", "flow.db")
+            if not os.path.exists(db_path):
+                return None
+
+            # 使用线程池执行同步数据库查询
+            def query_token():
+                conn = sqlite3.connect(db_path)
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM tokens WHERE current_project_id = ?", (project_id,))
+                row = cursor.fetchone()
+                conn.close()
+                if row:
+                    from ..core.models import Token
+                    return Token(**dict(row))
+                return None
+
+            return await _run_in_thread(query_token)
+        except Exception as e:
+            debug_logger.log_error(f"[DrissionCaptcha] 查询 Token 失败: {e}")
+            return None
+
+    async def _update_token_st(self, token_id: int, new_st: str):
+        """更新 Token 的 Session Token
+
+        Args:
+            token_id: Token ID
+            new_st: 新的 Session Token
+        """
+        try:
+            import sqlite3
+            db_path = os.path.join(os.getcwd(), "data", "flow.db")
+
+            def update_st():
+                conn = sqlite3.connect(db_path)
+                cursor = conn.cursor()
+                cursor.execute("UPDATE tokens SET st = ? WHERE id = ?", (new_st, token_id))
+                conn.commit()
+                conn.close()
+
+            await _run_in_thread(update_st)
+            debug_logger.log_info(f"[DrissionCaptcha] ✅ Token {token_id} 的 Session Token 已更新到数据库")
+        except Exception as e:
+            debug_logger.log_error(f"[DrissionCaptcha] 更新 Token {token_id} 的 Session Token 失败: {e}")
 
     async def _send_telegram_alert(self, message: str):
         """发送 Telegram 告警"""
