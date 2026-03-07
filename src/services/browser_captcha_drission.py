@@ -673,34 +673,21 @@ class DrissionCaptchaService:
 
         self.resident_project_id = project_id
         website_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
+        debug_logger.log_info(f"[DrissionCaptcha] 启动常驻模式（预热导航）: {website_url}")
 
-        debug_logger.log_info(f"[DrissionCaptcha] 启动常驻模式，访问页面: {website_url}")
-
-        # 直接在主窗口访问页面（使用 browser.get 比 new_tab 更稳定）
-        self.resident_tab = await _run_in_thread(self._sync_get_tab, website_url)
-
-        debug_logger.log_info("[DrissionCaptcha] 标签页已创建，等待页面加载...")
-
-        # 等待页面加载完成
-        page_loaded = await self._wait_page_load(self.resident_tab, timeout=60)
-
-        if not page_loaded:
-            debug_logger.log_error("[DrissionCaptcha] 页面加载超时，常驻模式启动失败")
+        # 启动阶段也走统一预热流程：google.com -> labs.google/fx/zh/tools/flow -> flow project
+        resident_info = await self._create_resident_tab(project_id)
+        if not resident_info:
+            debug_logger.log_error("[DrissionCaptcha] 常驻模式启动失败：预热导航创建标签页失败")
             return
 
-        # 等待 reCAPTCHA 加载
-        self._recaptcha_ready = await self._wait_for_recaptcha(self.resident_tab)
-
-        if not self._recaptcha_ready:
-            debug_logger.log_error("[DrissionCaptcha] reCAPTCHA 加载失败，常驻模式启动失败")
-            return
-
-        # 将当前标签页加入 _resident_tabs，以便 get_token() 能找到并复用
-        resident_info = ResidentTabInfo(self.resident_tab, project_id)
-        resident_info.recaptcha_ready = True
+        # 向后兼容旧属性
+        self.resident_tab = resident_info.tab
+        self._recaptcha_ready = resident_info.recaptcha_ready
         self._resident_tabs[project_id] = resident_info
-
         self._running = True
+        self._last_page_refresh_at = time.time()
+
         debug_logger.log_info(f"[DrissionCaptcha] ✅ 常驻模式已启动 (project: {project_id})")
 
     async def stop_resident_mode(self, project_id: Optional[str] = None):
