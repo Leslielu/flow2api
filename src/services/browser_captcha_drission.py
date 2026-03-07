@@ -130,6 +130,7 @@ def _run_in_thread(func, *args, **kwargs):
 
 # ==================== 心跳配置 ====================
 HEARTBEAT_INTERVAL = 600  # 10分钟 = 600秒
+PAGE_REFRESH_INTERVAL = 3500  # 约58分钟20秒
 TELEGRAM_API_URL = "http://localhost:5678/telegram/send"
 
 
@@ -176,6 +177,8 @@ class DrissionCaptchaService:
 
         # 心跳任务
         self._heartbeat_task: Optional[asyncio.Task] = None
+        # 页面健康检查/定时刷新时间戳
+        self._last_page_refresh_at = 0.0
 
     @classmethod
     async def get_instance(cls, db=None) -> 'DrissionCaptchaService':
@@ -346,19 +349,46 @@ class DrissionCaptchaService:
         """同步获取所有 cookies"""
         return self.browser.cookies()
 
+    def _sync_is_resident_page_healthy(self, tab, project_id: str) -> bool:
+        """同步检查常驻标签页是否健康（URL/DOM/reCAPTCHA）"""
+        try:
+            current_url = tab.url if hasattr(tab, 'url') else ''
+            expected_part = f"/tools/flow/project/{project_id}"
+            if not current_url or expected_part not in current_url:
+                return False
+
+            check_js = """
+            return (function() {
+                try {
+                    const hasDocument = typeof document !== 'undefined';
+                    if (!hasDocument) return false;
+                    const ready = document.readyState === 'complete' || document.readyState === 'interactive';
+                    const hasBody = !!document.body;
+                    const hasRecaptcha = typeof grecaptcha !== 'undefined' &&
+                        typeof grecaptcha.enterprise !== 'undefined';
+                    return ready && hasBody && hasRecaptcha;
+                } catch (e) {
+                    return false;
+                }
+            })();
+            """
+            js_ok = tab.run_js(check_js)
+            return bool(js_ok)
+        except Exception:
+            return False
+
     # ==================== 心跳机制 ====================
 
     async def _heartbeat_loop(self):
-        """后台心跳循环，每 10 分钟执行一次轻量 JS 保持 Chrome 活跃"""
+        """后台心跳循环：每10分钟探活，页面异常时自愈刷新；每1小时定时刷新一次"""
         debug_logger.log_info(f"[DrissionCaptcha] 心跳任务已启动（间隔 {HEARTBEAT_INTERVAL} 秒）")
 
         while True:
             try:
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
 
-                # 检查浏览器是否存活
+                # 1) 检查浏览器进程存活
                 is_alive = await _run_in_thread(self._sync_check_browser_alive)
-
                 if not is_alive:
                     debug_logger.log_error("[DrissionCaptcha] ❌ Chrome 浏览器已停止运行！")
                     await self._send_telegram_alert("⚠️ flow2api: Chrome 浏览器已停止运行，需要重启服务")
@@ -367,16 +397,23 @@ class DrissionCaptchaService:
                     self.browser = None
                     break
 
-                # 在主浏览器上执行心跳 JS
-                heartbeat_success = await _run_in_thread(self._sync_check_browser_alive)
+                # 2) 心跳成功日志
+                debug_logger.log_info(f"[DrissionCaptcha] ♥ 心跳成功（常驻标签页: {len(self._resident_tabs)} 个）")
 
-                if heartbeat_success:
-                    debug_logger.log_info(f"[DrissionCaptcha] ♥ 心跳成功（常驻标签页: {len(self._resident_tabs)} 个）")
-                    # 心跳成功后，检查并更新 Session Token
-                    await self._check_and_update_session_tokens()
-                else:
-                    debug_logger.log_warning("[DrissionCaptcha] 心跳检测失败，浏览器可能已停止")
-                    await self._send_telegram_alert("⚠️ flow2api: Chrome 心跳检测失败，浏览器可能已停止")
+                # 3) 页面健康检查（无常驻页则跳过）
+                page_ok = await self._check_resident_pages_health()
+                if not page_ok:
+                    debug_logger.log_warning("[DrissionCaptcha] 探活发现页面异常，已触发刷新")
+
+                # 4) 每小时定时刷新一次常驻页
+                now = time.time()
+                if self._resident_tabs and (now - self._last_page_refresh_at >= PAGE_REFRESH_INTERVAL):
+                    refresh_ok = await self._refresh_all_resident_tabs("定时刷新")
+                    if refresh_ok:
+                        self._last_page_refresh_at = now
+
+                # 5) 心跳后检查并更新 Session Token
+                await self._check_and_update_session_tokens()
 
             except asyncio.CancelledError:
                 debug_logger.log_info("[DrissionCaptcha] 心跳任务被取消")
@@ -384,6 +421,58 @@ class DrissionCaptchaService:
             except Exception as e:
                 debug_logger.log_error(f"[DrissionCaptcha] 心跳循环异常: {e}")
                 await self._send_telegram_alert(f"⚠️ flow2api: Chrome 心跳检测异常: {e}")
+
+    async def _refresh_all_resident_tabs(self, reason: str) -> bool:
+        """刷新所有常驻标签页并等待加载完成"""
+        if not self._resident_tabs:
+            return True
+
+        all_ok = True
+        for project_id, resident_info in list(self._resident_tabs.items()):
+            try:
+                if not resident_info or not resident_info.tab:
+                    all_ok = False
+                    continue
+                debug_logger.log_info(f"[DrissionCaptcha] [{reason}] 刷新常驻页 project={project_id}")
+                await _run_in_thread(self._sync_reload_tab, resident_info.tab)
+                page_loaded = await self._wait_page_load(resident_info.tab, timeout=30)
+                if not page_loaded:
+                    all_ok = False
+                    debug_logger.log_warning(f"[DrissionCaptcha] [{reason}] 刷新后页面仍未加载: project={project_id}")
+            except Exception as e:
+                all_ok = False
+                debug_logger.log_warning(f"[DrissionCaptcha] [{reason}] 刷新失败 project={project_id}: {e}")
+        return all_ok
+
+    async def _check_resident_pages_health(self) -> bool:
+        """检查常驻页健康；若异常则尝试刷新一次自愈"""
+        if not self._resident_tabs:
+            return True
+
+        unhealthy_projects = []
+        for project_id, resident_info in list(self._resident_tabs.items()):
+            try:
+                if not resident_info or not resident_info.tab:
+                    unhealthy_projects.append(project_id)
+                    continue
+                healthy = await _run_in_thread(
+                    self._sync_is_resident_page_healthy,
+                    resident_info.tab,
+                    project_id,
+                )
+                if not healthy:
+                    unhealthy_projects.append(project_id)
+            except Exception:
+                unhealthy_projects.append(project_id)
+
+        if not unhealthy_projects:
+            return True
+
+        debug_logger.log_warning(f"[DrissionCaptcha] 页面健康检查异常，准备刷新: {unhealthy_projects}")
+        ok = await self._refresh_all_resident_tabs("探活自愈")
+        if ok:
+            self._last_page_refresh_at = time.time()
+        return ok
 
     async def _check_and_update_session_tokens(self):
         """检查并更新 Session Token（心跳时调用）
