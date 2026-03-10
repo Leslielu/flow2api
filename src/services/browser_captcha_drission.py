@@ -349,6 +349,68 @@ class DrissionCaptchaService:
         """同步获取所有 cookies"""
         return self.browser.cookies()
 
+    def _extract_session_token_from_cookies(self, cookies) -> Optional[str]:
+        """从不同格式的 cookies 容器中提取 session token"""
+        target = "__Secure-next-auth.session-token"
+        if not cookies:
+            return None
+
+        # 格式1: {cookie_name: cookie_value}
+        if isinstance(cookies, dict):
+            value = cookies.get(target)
+            if value:
+                return value
+
+        # 格式2: 带 as_dict()/to_dict() 的 cookies 对象
+        for method_name in ("as_dict", "to_dict"):
+            method = getattr(cookies, method_name, None)
+            if callable(method):
+                try:
+                    data = method()
+                    if isinstance(data, dict):
+                        value = data.get(target)
+                        if value:
+                            return value
+                except Exception:
+                    pass
+
+        # 格式3: 支持 get(name)
+        getter = getattr(cookies, "get", None)
+        if callable(getter):
+            try:
+                value = getter(target)
+                if value:
+                    return value
+            except Exception:
+                pass
+
+        # 格式4: 可迭代 cookies（list/CookiesList/对象列表）
+        try:
+            iterator = iter(cookies)
+        except TypeError:
+            return None
+
+        for cookie in iterator:
+            if isinstance(cookie, dict):
+                if cookie.get("name") == target:
+                    value = cookie.get("value")
+                    if value:
+                        return value
+                value = cookie.get(target)
+                if value:
+                    return value
+            elif isinstance(cookie, (tuple, list)) and len(cookie) >= 2:
+                if cookie[0] == target and cookie[1]:
+                    return cookie[1]
+            else:
+                name = getattr(cookie, "name", None)
+                if name == target:
+                    value = getattr(cookie, "value", None)
+                    if value:
+                        return value
+
+        return None
+
     def _sync_is_resident_page_healthy(self, tab, project_id: str) -> bool:
         """同步检查常驻标签页是否健康（URL/DOM/reCAPTCHA）"""
         try:
@@ -484,33 +546,24 @@ class DrissionCaptchaService:
             return
 
         try:
-            # 获取所有 cookies
-            cookies = await _run_in_thread(self._sync_get_cookies)
-            if not cookies:
-                debug_logger.log_warning("[DrissionCaptcha] 无法获取 cookies，跳过 Session Token 检查")
-                return
-
-            # 提取 session token（DrissionPage 返回的是列表，每个元素是字典）
-            new_session_token = None
-            for cookie in cookies:
-                if isinstance(cookie, dict):
-                    if cookie.get('name') == '__Secure-next-auth.session-token':
-                        new_session_token = cookie.get('value')
-                        break
-                else:
-                    # 如果是对象，尝试获取属性
-                    name = getattr(cookie, 'name', None)
-                    if name == '__Secure-next-auth.session-token':
-                        new_session_token = getattr(cookie, 'value', None)
-                        break
-
-            if not new_session_token:
-                debug_logger.log_warning("[DrissionCaptcha] 未找到 __Secure-next-auth.session-token cookie")
-                return
-
-            # 遍历所有常驻标签页，检查对应 token 的 session token 是否需要更新
+            # 遍历所有常驻标签页，从各自的 tab 获取 cookies 并检查 session token
             for project_id, resident_info in list(self._resident_tabs.items()):
                 try:
+                    tab = resident_info.tab if resident_info else None
+                    if not tab:
+                        continue
+
+                    # 从标签页级别获取 cookies（而非 browser 级别）
+                    cookies = await _run_in_thread(tab.cookies)
+                    if not cookies:
+                        debug_logger.log_warning(f"[DrissionCaptcha] 常驻标签页 {project_id} 无法获取 cookies，跳过")
+                        continue
+
+                    # 提取 session token（兼容 dict / list / CookiesList 等多种格式）
+                    new_session_token = self._extract_session_token_from_cookies(cookies)
+                    if not new_session_token:
+                        continue
+
                     # 从数据库查询该 project_id 对应的 token
                     token = await self._get_token_by_project_id(project_id)
                     if not token:
@@ -1153,19 +1206,9 @@ class DrissionCaptchaService:
             session_token = None
 
             try:
-                # 使用 DrissionPage 的 cookies API
+                # 使用 DrissionPage 的 cookies API（兼容多种返回格式）
                 cookies = await _run_in_thread(self._sync_get_cookies)
-
-                # cookies 返回的是字典，需要查找
-                for cookie_name, cookie_value in cookies.items():
-                    if cookie_name == "__Secure-next-auth.session-token":
-                        session_token = cookie_value
-                        break
-
-                # DrissionPage 的 cookies(as_dict=True) 返回格式可能是 {name: value}
-                if not session_token and isinstance(cookies, dict):
-                    # 尝试直接从字典获取
-                    session_token = cookies.get("__Secure-next-auth.session-token")
+                session_token = self._extract_session_token_from_cookies(cookies)
 
             except Exception as e:
                 debug_logger.log_warning(f"[DrissionCaptcha] 通过 cookies API 获取失败: {e}，尝试从 document.cookie 获取...")
