@@ -38,6 +38,9 @@ class Token(BaseModel):
     image_concurrency: int = -1  # -1表示无限制
     video_concurrency: int = -1  # -1表示无限制
 
+    # 打码代理（token 级，可覆盖全局浏览器打码代理）
+    captcha_proxy_url: Optional[str] = None
+
     # 429禁用相关
     ban_reason: Optional[str] = None  # 禁用原因: "429_rate_limit" 或 None
     banned_at: Optional[datetime] = None  # 禁用时间
@@ -97,7 +100,10 @@ class RequestLog(BaseModel):
     response_body: Optional[str] = None
     status_code: int
     duration: float
+    status_text: Optional[str] = None
+    progress: int = 0
     created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
 
 class AdminConfig(BaseModel):
@@ -112,8 +118,10 @@ class AdminConfig(BaseModel):
 class ProxyConfig(BaseModel):
     """Proxy configuration"""
     id: int = 1
-    enabled: bool = False
-    proxy_url: Optional[str] = None
+    enabled: bool = False  # 请求代理开关
+    proxy_url: Optional[str] = None  # 请求代理地址
+    media_proxy_enabled: bool = False  # 图片上传/下载代理开关
+    media_proxy_url: Optional[str] = None  # 图片上传/下载代理地址
 
 
 class GenerationConfig(BaseModel):
@@ -127,7 +135,7 @@ class CacheConfig(BaseModel):
     """Cache configuration"""
     id: int = 1
     cache_enabled: bool = False
-    cache_timeout: int = 7200  # seconds (2 hours)
+    cache_timeout: int = 7200  # seconds (2 hours), 0 means never expire
     cache_base_url: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -147,7 +155,7 @@ class DebugConfig(BaseModel):
 class CaptchaConfig(BaseModel):
     """Captcha configuration"""
     id: int = 1
-    captcha_method: str = "browser"  # yescaptcha, capmonster, ezcaptcha, capsolver 或 browser
+    captcha_method: str = "browser"  # yescaptcha/capmonster/ezcaptcha/capsolver/browser/personal/remote_browser
     yescaptcha_api_key: str = ""
     yescaptcha_base_url: str = "https://api.yescaptcha.com"
     capmonster_api_key: str = ""
@@ -156,6 +164,9 @@ class CaptchaConfig(BaseModel):
     ezcaptcha_base_url: str = "https://api.ez-captcha.com"
     capsolver_api_key: str = ""
     capsolver_base_url: str = "https://api.capsolver.com"
+    remote_browser_base_url: str = ""
+    remote_browser_api_key: str = ""
+    remote_browser_timeout: int = 60
     website_key: str = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
     page_action: str = "IMAGE_GENERATION"
     browser_proxy_enabled: bool = False  # 浏览器打码是否启用代理

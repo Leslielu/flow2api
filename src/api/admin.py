@@ -1,14 +1,23 @@
 """Admin API routes"""
+import asyncio
+import json
+import urllib.error
+import urllib.request
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 import secrets
+import time
+import re
+from urllib.parse import urlparse
+from curl_cffi.requests import AsyncSession
 from ..core.auth import AuthManager
 from ..core.database import Database
 from ..core.config import config
 from ..services.token_manager import TokenManager
 from ..services.proxy_manager import ProxyManager
+from ..services.concurrency_manager import ConcurrencyManager
 
 router = APIRouter()
 
@@ -16,17 +25,304 @@ router = APIRouter()
 token_manager: TokenManager = None
 proxy_manager: ProxyManager = None
 db: Database = None
+concurrency_manager: Optional[ConcurrencyManager] = None
 
 # Store active admin session tokens (in production, use Redis or database)
 active_admin_tokens = set()
+SUPPORTED_API_CAPTCHA_METHODS = {"yescaptcha", "capmonster", "ezcaptcha", "capsolver"}
 
 
-def set_dependencies(tm: TokenManager, pm: ProxyManager, database: Database):
+def _mask_token(token: Optional[str]) -> str:
+    if not token:
+        return ""
+    if len(token) <= 24:
+        return token
+    return f"{token[:18]}...{token[-8:]}"
+
+
+def _guess_client_hints_from_user_agent(user_agent: str) -> Dict[str, str]:
+    """根据 UA 补全常见的 sec-ch-* 头。"""
+    ua = (user_agent or "").strip()
+    if not ua:
+        return {}
+
+    headers: Dict[str, str] = {}
+    major_match = re.search(r"(?:Chrome|Chromium|Edg|EdgA|EdgiOS)/(\d+)", ua)
+    is_mobile = any(token in ua for token in ("Android", "iPhone", "iPad", "Mobile"))
+    headers["sec-ch-ua-mobile"] = "?1" if is_mobile else "?0"
+
+    if "Windows" in ua:
+        headers["sec-ch-ua-platform"] = '"Windows"'
+    elif "Macintosh" in ua or "Mac OS X" in ua:
+        headers["sec-ch-ua-platform"] = '"macOS"'
+    elif "Android" in ua:
+        headers["sec-ch-ua-platform"] = '"Android"'
+    elif "iPhone" in ua or "iPad" in ua:
+        headers["sec-ch-ua-platform"] = '"iOS"'
+    elif "Linux" in ua:
+        headers["sec-ch-ua-platform"] = '"Linux"'
+
+    if major_match:
+        major = major_match.group(1)
+        if "Edg/" in ua:
+            headers["sec-ch-ua"] = (
+                f'"Not:A-Brand";v="99", "Microsoft Edge";v="{major}", "Chromium";v="{major}"'
+            )
+        else:
+            headers["sec-ch-ua"] = (
+                f'"Not:A-Brand";v="99", "Google Chrome";v="{major}", "Chromium";v="{major}"'
+            )
+
+    return headers
+
+
+def _guess_impersonate_from_user_agent(user_agent: str) -> str:
+    """从 UA 选择可用的 curl_cffi 浏览器指纹版本。"""
+    ua = (user_agent or "").strip()
+    major_match = re.search(r"(?:Chrome|Chromium|Edg|EdgA|EdgiOS)/(\d+)", ua)
+    if not major_match:
+        return "chrome120"
+
+    try:
+        major = int(major_match.group(1))
+    except Exception:
+        return "chrome120"
+
+    if major >= 124:
+        return "chrome124"
+    if major >= 120:
+        return "chrome120"
+    return "chrome120"
+
+
+def _build_proxy_map(proxy_url: str) -> Optional[Dict[str, str]]:
+    normalized = (proxy_url or "").strip()
+    if not normalized:
+        return None
+    return {"http": normalized, "https": normalized}
+
+
+def _normalize_http_base_url(base_url: str) -> str:
+    normalized = (base_url or "").strip().rstrip("/")
+    if not normalized:
+        raise RuntimeError("远程打码服务地址未配置")
+
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError("远程打码服务地址格式错误，必须是 http(s)://host[:port]")
+
+    return normalized
+
+
+def _get_remote_browser_client_config() -> tuple[str, str, int]:
+    base_url = _normalize_http_base_url(config.remote_browser_base_url)
+    api_key = (config.remote_browser_api_key or "").strip()
+    if not api_key:
+        raise RuntimeError("远程打码服务 API Key 未配置")
+    timeout = max(5, int(config.remote_browser_timeout or 60))
+    return base_url, api_key, timeout
+
+
+def _sync_json_http_request(
+    method: str,
+    url: str,
+    headers: Dict[str, str],
+    payload: Optional[Dict[str, Any]],
+    timeout: int,
+) -> tuple[int, Optional[Any], str]:
+    req_headers = dict(headers or {})
+    req_headers.setdefault("Accept", "application/json")
+
+    data = None
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req_headers["Content-Type"] = "application/json; charset=utf-8"
+
+    request = urllib.request.Request(
+        url=url,
+        data=data,
+        headers=req_headers,
+        method=(method or "GET").upper(),
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status_code = int(response.getcode() or 0)
+            raw_body = response.read()
+    except urllib.error.HTTPError as e:
+        status_code = int(getattr(e, "code", 500))
+        raw_body = e.read() if hasattr(e, "read") else b""
+    except Exception as e:
+        raise RuntimeError(f"远程打码服务请求失败: {e}") from e
+
+    text = raw_body.decode("utf-8", errors="replace") if raw_body else ""
+    parsed: Optional[Any] = None
+    if text:
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = None
+
+    return status_code, parsed, text
+
+
+async def _resolve_score_test_verify_proxy(
+    captcha_method: str,
+    browser_proxy_enabled: bool,
+    browser_proxy_url: str
+) -> tuple[Optional[Dict[str, str]], bool, str, str]:
+    """
+    选择 score-test 的 verify 请求代理，优先与浏览器打码代理保持一致。
+    返回: (proxies, used, source, proxy_url)
+    """
+    # 浏览器打码模式优先使用 browser_proxy，确保与取 token 出口一致
+    if captcha_method in {"browser", "personal"} and browser_proxy_enabled and browser_proxy_url:
+        proxy_map = _build_proxy_map(browser_proxy_url)
+        if proxy_map:
+            return proxy_map, True, "captcha_browser_proxy", browser_proxy_url
+
+    # 退回请求代理配置
+    try:
+        if proxy_manager:
+            proxy_cfg = await proxy_manager.get_proxy_config()
+            if proxy_cfg and proxy_cfg.enabled and proxy_cfg.proxy_url:
+                proxy_map = _build_proxy_map(proxy_cfg.proxy_url)
+                if proxy_map:
+                    return proxy_map, True, "request_proxy", proxy_cfg.proxy_url
+    except Exception:
+        pass
+
+    return None, False, "none", ""
+
+
+async def _solve_recaptcha_with_api_service(
+    method: str,
+    website_url: str,
+    website_key: str,
+    action: str,
+    enterprise: bool = False
+) -> Optional[str]:
+    """使用当前配置的第三方打码服务获取 token。"""
+    if method == "yescaptcha":
+        client_key = config.yescaptcha_api_key
+        base_url = config.yescaptcha_base_url
+        task_type = "RecaptchaV3TaskProxylessM1"
+    elif method == "capmonster":
+        client_key = config.capmonster_api_key
+        base_url = config.capmonster_base_url
+        task_type = "RecaptchaV3TaskProxyless"
+    elif method == "ezcaptcha":
+        client_key = config.ezcaptcha_api_key
+        base_url = config.ezcaptcha_base_url
+        task_type = "ReCaptchaV3TaskProxylessS9"
+    elif method == "capsolver":
+        client_key = config.capsolver_api_key
+        base_url = config.capsolver_base_url
+        task_type = "ReCaptchaV3EnterpriseTaskProxyLess" if enterprise else "ReCaptchaV3TaskProxyLess"
+    else:
+        raise RuntimeError(f"不支持的打码方式: {method}")
+
+    if not client_key:
+        raise RuntimeError(f"{method} API Key 未配置")
+
+    task: Dict[str, Any] = {
+        "websiteURL": website_url,
+        "websiteKey": website_key,
+        "type": task_type,
+        "pageAction": action,
+    }
+
+    if enterprise and method == "capsolver":
+        task["isEnterprise"] = True
+
+    create_url = f"{base_url.rstrip('/')}/createTask"
+    get_url = f"{base_url.rstrip('/')}/getTaskResult"
+
+    async with AsyncSession() as session:
+        create_resp = await session.post(
+            create_url,
+            json={"clientKey": client_key, "task": task},
+            impersonate="chrome120",
+            timeout=30
+        )
+        create_json = create_resp.json()
+        task_id = create_json.get("taskId")
+
+        if not task_id:
+            error_desc = create_json.get("errorDescription") or create_json.get("errorMessage") or str(create_json)
+            raise RuntimeError(f"{method} createTask 失败: {error_desc}")
+
+        for _ in range(40):
+            poll_resp = await session.post(
+                get_url,
+                json={"clientKey": client_key, "taskId": task_id},
+                impersonate="chrome120",
+                timeout=30
+            )
+            poll_json = poll_resp.json()
+            if poll_json.get("status") == "ready":
+                solution = poll_json.get("solution", {}) or {}
+                token = solution.get("gRecaptchaResponse") or solution.get("token")
+                if token:
+                    return token
+                raise RuntimeError(f"{method} 返回结果缺少 token: {poll_json}")
+
+            if poll_json.get("errorId") not in (None, 0):
+                error_desc = poll_json.get("errorDescription") or poll_json.get("errorMessage") or str(poll_json)
+                raise RuntimeError(f"{method} getTaskResult 失败: {error_desc}")
+
+            await asyncio.sleep(3)
+
+    raise RuntimeError(f"{method} 获取 token 超时")
+
+
+async def _score_test_with_remote_browser_service(
+    website_url: str,
+    website_key: str,
+    verify_url: str,
+    action: str,
+    enterprise: bool = False,
+) -> Dict[str, Any]:
+    """调用远程有头打码服务执行页面内打码+分数校验。"""
+    base_url, api_key, timeout = _get_remote_browser_client_config()
+    endpoint = f"{base_url}/api/v1/custom-score"
+    request_payload = {
+        "website_url": website_url,
+        "website_key": website_key,
+        "verify_url": verify_url,
+        "action": action,
+        "enterprise": enterprise,
+    }
+
+    status_code, response_payload, response_text = await asyncio.to_thread(
+        _sync_json_http_request,
+        "POST",
+        endpoint,
+        {"Authorization": f"Bearer {api_key}"},
+        request_payload,
+        timeout,
+    )
+
+    if status_code >= 400:
+        detail = ""
+        if isinstance(response_payload, dict):
+            detail = response_payload.get("detail") or response_payload.get("message") or str(response_payload)
+        if not detail:
+            detail = (response_text or "").strip()
+        raise RuntimeError(f"远程打码服务请求失败 (HTTP {status_code}): {detail or '未知错误'}")
+
+    if not isinstance(response_payload, dict):
+        raise RuntimeError("远程打码服务返回格式错误")
+    return response_payload
+
+
+def set_dependencies(tm: TokenManager, pm: ProxyManager, database: Database, cm: Optional[ConcurrencyManager] = None):
     """Set service instances"""
-    global token_manager, proxy_manager, db
+    global token_manager, proxy_manager, db, concurrency_manager
     token_manager = tm
     proxy_manager = pm
     db = database
+    concurrency_manager = cm
 
 
 # ========== Request Models ==========
@@ -41,6 +337,7 @@ class AddTokenRequest(BaseModel):
     project_id: Optional[str] = None  # 用户可选输入project_id
     project_name: Optional[str] = None
     remark: Optional[str] = None
+    captcha_proxy_url: Optional[str] = None
     image_enabled: bool = True
     video_enabled: bool = True
     image_concurrency: int = -1
@@ -52,6 +349,7 @@ class UpdateTokenRequest(BaseModel):
     project_id: Optional[str] = None  # 用户可选输入project_id
     project_name: Optional[str] = None
     remark: Optional[str] = None
+    captcha_proxy_url: Optional[str] = None
     image_enabled: Optional[bool] = None
     video_enabled: Optional[bool] = None
     image_concurrency: Optional[int] = None
@@ -61,6 +359,22 @@ class UpdateTokenRequest(BaseModel):
 class ProxyConfigRequest(BaseModel):
     proxy_enabled: bool
     proxy_url: Optional[str] = None
+    media_proxy_enabled: Optional[bool] = None
+    media_proxy_url: Optional[str] = None
+
+
+class ProxyTestRequest(BaseModel):
+    proxy_url: str
+    test_url: Optional[str] = "https://labs.google/"
+    timeout_seconds: Optional[int] = 15
+
+
+class CaptchaScoreTestRequest(BaseModel):
+    website_url: Optional[str] = "https://antcpt.com/score_detector/"
+    website_key: Optional[str] = "6LcR_okUAAAAAPYrPe-HK_0RULO1aZM15ENyM-Mf"
+    action: Optional[str] = "homepage"
+    verify_url: Optional[str] = "https://antcpt.com/score_detector/verify.php"
+    enterprise: Optional[bool] = False
 
 
 class GenerationConfigRequest(BaseModel):
@@ -97,6 +411,7 @@ class ImportTokenItem(BaseModel):
     access_token: Optional[str] = None
     session_token: Optional[str] = None
     is_active: bool = True
+    captcha_proxy_url: Optional[str] = None
     image_enabled: bool = True
     video_enabled: bool = True
     image_concurrency: int = -1
@@ -187,39 +502,35 @@ async def change_password(
 @router.get("/api/tokens")
 async def get_tokens(token: str = Depends(verify_admin_token)):
     """Get all tokens with statistics"""
-    tokens = await token_manager.get_all_tokens()
-    result = []
+    token_rows = await db.get_all_tokens_with_stats()
+    to_iso = lambda value: value.isoformat() if hasattr(value, "isoformat") else value
 
-    for t in tokens:
-        stats = await db.get_token_stats(t.id)
-
-        result.append({
-            "id": t.id,
-            "st": t.st,  # Session Token for editing
-            "at": t.at,  # Access Token for editing (从ST转换而来)
-            "at_expires": t.at_expires.isoformat() if t.at_expires else None,  # 🆕 AT过期时间
-            "token": t.at,  # 兼容前端 token.token 的访问方式
-            "email": t.email,
-            "name": t.name,
-            "remark": t.remark,
-            "is_active": t.is_active,
-            "created_at": t.created_at.isoformat() if t.created_at else None,
-            "last_used_at": t.last_used_at.isoformat() if t.last_used_at else None,
-            "use_count": t.use_count,
-            "credits": t.credits,  # 🆕 余额
-            "user_paygate_tier": t.user_paygate_tier,
-            "current_project_id": t.current_project_id,  # 🆕 项目ID
-            "current_project_name": t.current_project_name,  # 🆕 项目名称
-            "image_enabled": t.image_enabled,
-            "video_enabled": t.video_enabled,
-            "image_concurrency": t.image_concurrency,
-            "video_concurrency": t.video_concurrency,
-            "image_count": stats.image_count if stats else 0,
-            "video_count": stats.video_count if stats else 0,
-            "error_count": stats.error_count if stats else 0
-        })
-
-    return result  # 直接返回数组,兼容前端
+    return [{
+        "id": row.get("id"),
+        "st": row.get("st"),  # Session Token for editing
+        "at": row.get("at"),  # Access Token for editing (从ST转换而来)
+        "at_expires": to_iso(row.get("at_expires")) if row.get("at_expires") else None,  # 🆕 AT过期时间
+        "token": row.get("at"),  # 兼容前端 token.token 的访问方式
+        "email": row.get("email"),
+        "name": row.get("name"),
+        "remark": row.get("remark"),
+        "is_active": bool(row.get("is_active")),
+        "created_at": to_iso(row.get("created_at")) if row.get("created_at") else None,
+        "last_used_at": to_iso(row.get("last_used_at")) if row.get("last_used_at") else None,
+        "use_count": row.get("use_count"),
+        "credits": row.get("credits"),  # 🆕 余额
+        "user_paygate_tier": row.get("user_paygate_tier"),
+        "current_project_id": row.get("current_project_id"),  # 🆕 项目ID
+        "current_project_name": row.get("current_project_name"),  # 🆕 项目名称
+        "captcha_proxy_url": row.get("captcha_proxy_url") or "",
+        "image_enabled": bool(row.get("image_enabled")),
+        "video_enabled": bool(row.get("video_enabled")),
+        "image_concurrency": row.get("image_concurrency"),
+        "video_concurrency": row.get("video_concurrency"),
+        "image_count": row.get("image_count", 0),
+        "video_count": row.get("video_count", 0),
+        "error_count": row.get("error_count", 0)
+    } for row in token_rows]  # 直接返回数组,兼容前端
 
 
 @router.post("/api/tokens")
@@ -234,11 +545,20 @@ async def add_token(
             project_id=request.project_id,  # 🆕 支持用户指定project_id
             project_name=request.project_name,
             remark=request.remark,
+            captcha_proxy_url=request.captcha_proxy_url.strip() if request.captcha_proxy_url is not None else None,
             image_enabled=request.image_enabled,
             video_enabled=request.video_enabled,
             image_concurrency=request.image_concurrency,
             video_concurrency=request.video_concurrency
         )
+
+        # 热更新并发限制，避免必须重启服务
+        if concurrency_manager:
+            await concurrency_manager.reset_token(
+                new_token.id,
+                image_concurrency=new_token.image_concurrency,
+                video_concurrency=new_token.video_concurrency
+            )
 
         return {
             "success": True,
@@ -288,11 +608,22 @@ async def update_token(
             project_id=request.project_id,
             project_name=request.project_name,
             remark=request.remark,
+            captcha_proxy_url=request.captcha_proxy_url.strip() if request.captcha_proxy_url is not None else None,
             image_enabled=request.image_enabled,
             video_enabled=request.video_enabled,
             image_concurrency=request.image_concurrency,
             video_concurrency=request.video_concurrency
         )
+
+        # 热更新并发限制，确保管理台修改立即生效
+        if concurrency_manager:
+            updated_token = await token_manager.get_token(token_id)
+            if updated_token:
+                await concurrency_manager.reset_token(
+                    token_id,
+                    image_concurrency=updated_token.image_concurrency,
+                    video_concurrency=updated_token.video_concurrency
+                )
 
         return {"success": True, "message": "Token更新成功"}
     except Exception as e:
@@ -431,6 +762,11 @@ async def import_tokens(
     added = 0
     updated = 0
     errors = []
+    # 保持与历史逻辑一致：按 created_at DESC 的结果中，优先命中同邮箱“最新一条”
+    existing_by_email = {}
+    for existing_token in await token_manager.get_all_tokens():
+        if existing_token.email and existing_token.email not in existing_by_email:
+            existing_by_email[existing_token.email] = existing_token
 
     for idx, item in enumerate(request.tokens):
         try:
@@ -464,8 +800,7 @@ async def import_tokens(
                         pass
 
                 # 使用邮箱检查是否已存在
-                existing_tokens = await token_manager.get_all_tokens()
-                existing = next((t for t in existing_tokens if t.email == email), None)
+                existing = existing_by_email.get(email)
 
                 if existing:
                     # 更新现有Token
@@ -474,6 +809,7 @@ async def import_tokens(
                         st=st,
                         at=at,
                         at_expires=at_expires,
+                        captcha_proxy_url=item.captcha_proxy_url.strip() if item.captcha_proxy_url is not None else None,
                         image_enabled=item.image_enabled,
                         video_enabled=item.video_enabled,
                         image_concurrency=item.image_concurrency,
@@ -482,11 +818,21 @@ async def import_tokens(
                     # 如果过期则禁用
                     if is_expired:
                         await token_manager.disable_token(existing.id)
+                        existing.is_active = False
+                    existing.st = st
+                    existing.at = at
+                    existing.at_expires = at_expires
+                    existing.captcha_proxy_url = item.captcha_proxy_url
+                    existing.image_enabled = item.image_enabled
+                    existing.video_enabled = item.video_enabled
+                    existing.image_concurrency = item.image_concurrency
+                    existing.video_concurrency = item.video_concurrency
                     updated += 1
                 else:
                     # 添加新Token
                     new_token = await token_manager.add_token(
                         st=st,
+                        captcha_proxy_url=item.captcha_proxy_url.strip() if item.captcha_proxy_url is not None else None,
                         image_enabled=item.image_enabled,
                         video_enabled=item.video_enabled,
                         image_concurrency=item.image_concurrency,
@@ -495,6 +841,8 @@ async def import_tokens(
                     # 如果过期则禁用
                     if is_expired:
                         await token_manager.disable_token(new_token.id)
+                        new_token.is_active = False
+                    existing_by_email[email] = new_token
                     added += 1
 
             except Exception as e:
@@ -522,7 +870,9 @@ async def get_proxy_config(token: str = Depends(verify_admin_token)):
         "success": True,
         "config": {
             "enabled": config.enabled,
-            "proxy_url": config.proxy_url
+            "proxy_url": config.proxy_url,
+            "media_proxy_enabled": config.media_proxy_enabled,
+            "media_proxy_url": config.media_proxy_url
         }
     }
 
@@ -533,7 +883,9 @@ async def get_proxy_config_alias(token: str = Depends(verify_admin_token)):
     config = await proxy_manager.get_proxy_config()
     return {
         "proxy_enabled": config.enabled,  # Frontend expects proxy_enabled
-        "proxy_url": config.proxy_url
+        "proxy_url": config.proxy_url,
+        "media_proxy_enabled": config.media_proxy_enabled,
+        "media_proxy_url": config.media_proxy_url
     }
 
 
@@ -543,7 +895,15 @@ async def update_proxy_config_alias(
     token: str = Depends(verify_admin_token)
 ):
     """Update proxy configuration (alias for frontend compatibility)"""
-    await proxy_manager.update_proxy_config(request.proxy_enabled, request.proxy_url)
+    try:
+        await proxy_manager.update_proxy_config(
+            enabled=request.proxy_enabled,
+            proxy_url=request.proxy_url,
+            media_proxy_enabled=request.media_proxy_enabled,
+            media_proxy_url=request.media_proxy_url
+        )
+    except ValueError as e:
+        return {"success": False, "message": str(e)}
     return {"success": True, "message": "代理配置更新成功"}
 
 
@@ -553,8 +913,79 @@ async def update_proxy_config(
     token: str = Depends(verify_admin_token)
 ):
     """Update proxy configuration"""
-    await proxy_manager.update_proxy_config(request.proxy_enabled, request.proxy_url)
+    try:
+        await proxy_manager.update_proxy_config(
+            enabled=request.proxy_enabled,
+            proxy_url=request.proxy_url,
+            media_proxy_enabled=request.media_proxy_enabled,
+            media_proxy_url=request.media_proxy_url
+        )
+    except ValueError as e:
+        return {"success": False, "message": str(e)}
     return {"success": True, "message": "代理配置更新成功"}
+
+
+@router.post("/api/proxy/test")
+async def test_proxy_connectivity(
+    request: ProxyTestRequest,
+    token: str = Depends(verify_admin_token)
+):
+    """测试代理是否可访问目标站点（默认 https://labs.google/）"""
+    proxy_input = (request.proxy_url or "").strip()
+    test_url = (request.test_url or "https://labs.google/").strip()
+    timeout_seconds = int(request.timeout_seconds or 15)
+    timeout_seconds = max(5, min(timeout_seconds, 60))
+
+    if not proxy_input:
+        return {
+            "success": False,
+            "message": "代理地址为空",
+            "test_url": test_url
+        }
+
+    try:
+        proxy_url = proxy_manager.normalize_proxy_url(proxy_input)
+    except ValueError as e:
+        return {
+            "success": False,
+            "message": str(e),
+            "test_url": test_url
+        }
+
+    start_time = time.time()
+    try:
+        proxies = {"http": proxy_url, "https": proxy_url}
+        async with AsyncSession() as session:
+            resp = await session.get(
+                test_url,
+                proxies=proxies,
+                timeout=timeout_seconds,
+                impersonate="chrome120",
+                allow_redirects=True,
+                verify=False
+            )
+
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        status_code = resp.status_code
+        final_url = str(resp.url)
+        ok = 200 <= status_code < 400
+
+        return {
+            "success": ok,
+            "message": "代理可用" if ok else f"代理可连通，但目标返回状态码 {status_code}",
+            "test_url": test_url,
+            "final_url": final_url,
+            "status_code": status_code,
+            "elapsed_ms": elapsed_ms
+        }
+    except Exception as e:
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        return {
+            "success": False,
+            "message": f"代理测试失败: {str(e)}",
+            "test_url": test_url,
+            "elapsed_ms": elapsed_ms
+        }
 
 
 @router.get("/api/config/generation")
@@ -589,17 +1020,14 @@ async def update_generation_config(
 @router.get("/api/system/info")
 async def get_system_info(token: str = Depends(verify_admin_token)):
     """Get system information"""
-    tokens = await token_manager.get_all_tokens()
-    active_tokens = [t for t in tokens if t.is_active]
-
-    total_credits = sum(t.credits for t in active_tokens)
+    stats = await db.get_system_info_stats()
 
     return {
         "success": True,
         "info": {
-            "total_tokens": len(tokens),
-            "active_tokens": len(active_tokens),
-            "total_credits": total_credits,
+            "total_tokens": stats["total_tokens"],
+            "active_tokens": stats["active_tokens"],
+            "total_credits": stats["total_credits"],
             "version": "1.0.0"
         }
     }
@@ -622,37 +1050,7 @@ async def logout(token: str = Depends(verify_admin_token)):
 @router.get("/api/stats")
 async def get_stats(token: str = Depends(verify_admin_token)):
     """Get statistics for dashboard"""
-    tokens = await token_manager.get_all_tokens()
-    active_tokens = [t for t in tokens if t.is_active]
-
-    # Calculate totals
-    total_images = 0
-    total_videos = 0
-    total_errors = 0
-    today_images = 0
-    today_videos = 0
-    today_errors = 0
-
-    for t in tokens:
-        stats = await db.get_token_stats(t.id)
-        if stats:
-            total_images += stats.image_count
-            total_videos += stats.video_count
-            total_errors += stats.error_count  # Historical total errors
-            today_images += stats.today_image_count
-            today_videos += stats.today_video_count
-            today_errors += stats.today_error_count
-
-    return {
-        "total_tokens": len(tokens),
-        "active_tokens": len(active_tokens),
-        "total_images": total_images,
-        "total_videos": total_videos,
-        "total_errors": total_errors,
-        "today_images": today_images,
-        "today_videos": today_videos,
-        "today_errors": today_errors
-    }
+    return await db.get_dashboard_stats()
 
 
 @router.get("/api/logs")
@@ -660,8 +1058,9 @@ async def get_logs(
     limit: int = 100,
     token: str = Depends(verify_admin_token)
 ):
-    """Get request logs with token email"""
-    logs = await db.get_logs(limit=limit)
+    """Get lightweight request logs for list view"""
+    limit = max(1, min(limit, 100))
+    logs = await db.get_logs(limit=limit, include_payload=False)
 
     return [{
         "id": log.get("id"),
@@ -671,10 +1070,38 @@ async def get_logs(
         "operation": log.get("operation"),
         "status_code": log.get("status_code"),
         "duration": log.get("duration"),
+        "status_text": log.get("status_text") or "",
+        "progress": log.get("progress") or 0,
         "created_at": log.get("created_at"),
+        "updated_at": log.get("updated_at")
+    } for log in logs]
+
+
+@router.get("/api/logs/{log_id}")
+async def get_log_detail(
+    log_id: int,
+    token: str = Depends(verify_admin_token)
+):
+    """Get single request log detail (payload loaded on demand)"""
+    log = await db.get_log_detail(log_id)
+    if not log:
+        raise HTTPException(status_code=404, detail="日志不存在")
+
+    return {
+        "id": log.get("id"),
+        "token_id": log.get("token_id"),
+        "token_email": log.get("token_email"),
+        "token_username": log.get("token_username"),
+        "operation": log.get("operation"),
+        "status_code": log.get("status_code"),
+        "duration": log.get("duration"),
+        "status_text": log.get("status_text") or "",
+        "progress": log.get("progress") or 0,
+        "created_at": log.get("created_at"),
+        "updated_at": log.get("updated_at"),
         "request_body": log.get("request_body"),
         "response_body": log.get("response_body")
-    } for log in logs]
+    }
 
 
 @router.delete("/api/logs")
@@ -797,6 +1224,11 @@ async def update_token_refresh_enabled(
     }
 
 
+def _sync_runtime_cache_config():
+    from . import routes
+    if routes.generation_handler and routes.generation_handler.file_cache:
+        routes.generation_handler.file_cache.set_timeout(config.cache_timeout)
+
 # ========== Cache Configuration Endpoints ==========
 
 @router.get("/api/cache/config")
@@ -829,6 +1261,7 @@ async def update_cache_enabled(
 
     # 🔥 Hot reload: sync database config to memory
     await db.reload_config_to_memory()
+    _sync_runtime_cache_config()
 
     return {"success": True, "message": f"缓存已{'启用' if enabled else '禁用'}"}
 
@@ -843,10 +1276,19 @@ async def update_cache_config_full(
     timeout = request.get("timeout")
     base_url = request.get("base_url")
 
+    if timeout is not None:
+        try:
+            timeout = int(timeout)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="缓存超时时间必须为整数")
+        if timeout < 0:
+            raise HTTPException(status_code=400, detail="缓存超时时间不能小于 0")
+
     await db.update_cache_config(enabled=enabled, timeout=timeout, base_url=base_url)
 
     # 🔥 Hot reload: sync database config to memory
     await db.reload_config_to_memory()
+    _sync_runtime_cache_config()
 
     return {"success": True, "message": "缓存配置更新成功"}
 
@@ -862,6 +1304,7 @@ async def update_cache_base_url(
 
     # 🔥 Hot reload: sync database config to memory
     await db.reload_config_to_memory()
+    _sync_runtime_cache_config()
 
     return {"success": True, "message": "缓存Base URL更新成功"}
 
@@ -883,6 +1326,9 @@ async def update_captcha_config(
     ezcaptcha_base_url = request.get("ezcaptcha_base_url")
     capsolver_api_key = request.get("capsolver_api_key")
     capsolver_base_url = request.get("capsolver_base_url")
+    remote_browser_base_url = request.get("remote_browser_base_url")
+    remote_browser_api_key = request.get("remote_browser_api_key")
+    remote_browser_timeout = request.get("remote_browser_timeout", 60)
     browser_proxy_enabled = request.get("browser_proxy_enabled", False)
     browser_proxy_url = request.get("browser_proxy_url", "")
     browser_count = request.get("browser_count", 1)
@@ -892,6 +1338,23 @@ async def update_captcha_config(
         is_valid, error_msg = validate_browser_proxy_url(browser_proxy_url)
         if not is_valid:
             return {"success": False, "message": error_msg}
+
+    if remote_browser_base_url:
+        try:
+            remote_browser_base_url = _normalize_http_base_url(remote_browser_base_url)
+        except RuntimeError as e:
+            return {"success": False, "message": str(e)}
+
+    try:
+        remote_browser_timeout = max(5, int(remote_browser_timeout or 60))
+    except Exception:
+        return {"success": False, "message": "远程打码超时时间必须是整数秒"}
+
+    if captcha_method == "remote_browser":
+        if not (remote_browser_base_url or "").strip():
+            return {"success": False, "message": "remote_browser 模式需要配置远程打码服务地址"}
+        if not (remote_browser_api_key or "").strip():
+            return {"success": False, "message": "remote_browser 模式需要配置远程打码服务 API Key"}
 
     await db.update_captcha_config(
         captcha_method=captcha_method,
@@ -903,6 +1366,9 @@ async def update_captcha_config(
         ezcaptcha_base_url=ezcaptcha_base_url,
         capsolver_api_key=capsolver_api_key,
         capsolver_base_url=capsolver_base_url,
+        remote_browser_base_url=remote_browser_base_url,
+        remote_browser_api_key=remote_browser_api_key,
+        remote_browser_timeout=remote_browser_timeout,
         browser_proxy_enabled=browser_proxy_enabled,
         browser_proxy_url=browser_proxy_url if browser_proxy_enabled else None,
         browser_count=max(1, int(browser_count)) if browser_count else 1
@@ -937,10 +1403,315 @@ async def get_captcha_config(token: str = Depends(verify_admin_token)):
         "ezcaptcha_base_url": captcha_config.ezcaptcha_base_url,
         "capsolver_api_key": captcha_config.capsolver_api_key,
         "capsolver_base_url": captcha_config.capsolver_base_url,
+        "remote_browser_base_url": captcha_config.remote_browser_base_url,
+        "remote_browser_api_key": captcha_config.remote_browser_api_key,
+        "remote_browser_timeout": captcha_config.remote_browser_timeout,
         "browser_proxy_enabled": captcha_config.browser_proxy_enabled,
         "browser_proxy_url": captcha_config.browser_proxy_url or "",
         "browser_count": captcha_config.browser_count
     }
+
+
+@router.post("/api/captcha/score-test")
+async def test_captcha_score(
+    request: Optional[CaptchaScoreTestRequest] = None,
+    token: str = Depends(verify_admin_token)
+):
+    """使用当前打码方式获取 token，并提交到 antcpt 校验分数。"""
+    req = request or CaptchaScoreTestRequest()
+    website_url = (req.website_url or "https://antcpt.com/score_detector/").strip()
+    website_key = (req.website_key or "6LcR_okUAAAAAPYrPe-HK_0RULO1aZM15ENyM-Mf").strip()
+    action = (req.action or "homepage").strip()
+    verify_url = (req.verify_url or "https://antcpt.com/score_detector/verify.php").strip()
+    enterprise = bool(req.enterprise)
+
+    started_at = time.time()
+    captcha_config = await db.get_captcha_config()
+    captcha_method = (captcha_config.captcha_method or config.captcha_method or "").strip().lower()
+    browser_proxy_enabled = bool(captcha_config.browser_proxy_enabled)
+    browser_proxy_url = captcha_config.browser_proxy_url or ""
+
+    token_value: Optional[str] = None
+    fingerprint: Optional[Dict[str, Any]] = None
+    token_elapsed_ms = 0
+    verify_elapsed_ms = 0
+    verify_http_status = None
+    verify_result: Dict[str, Any] = {}
+    verify_headers: Dict[str, str] = {}
+    verify_proxy_used = False
+    verify_proxy_source = "none"
+    verify_proxy_url = ""
+    verify_impersonate = "chrome120"
+    page_verify_only = captcha_method in {"browser", "personal", "remote_browser"}
+    verify_mode = "browser_page" if page_verify_only else "server_post"
+
+    try:
+        token_start = time.time()
+        if captcha_method == "browser":
+            from ..services.browser_captcha import BrowserCaptchaService
+            service = await BrowserCaptchaService.get_instance(db)
+            score_payload, browser_id = await service.get_custom_score(
+                website_url=website_url,
+                website_key=website_key,
+                verify_url=verify_url,
+                action=action,
+                enterprise=enterprise
+            )
+            if isinstance(score_payload, dict):
+                token_value = score_payload.get("token")
+                verify_elapsed_ms = int(score_payload.get("verify_elapsed_ms") or 0)
+                verify_http_status = score_payload.get("verify_http_status")
+                verify_result = score_payload.get("verify_result") if isinstance(score_payload.get("verify_result"), dict) else {}
+                verify_mode = score_payload.get("verify_mode") or "browser_page"
+                score_token_elapsed = score_payload.get("token_elapsed_ms")
+                if isinstance(score_token_elapsed, (int, float)):
+                    token_elapsed_ms = int(score_token_elapsed)
+            if token_value:
+                fingerprint = await service.get_fingerprint(browser_id)
+                verify_proxy_used = bool(browser_proxy_enabled and browser_proxy_url)
+                verify_proxy_source = "captcha_browser_proxy" if verify_proxy_used else "browser_direct"
+                verify_proxy_url = browser_proxy_url if verify_proxy_used else ""
+        elif captcha_method == "personal":
+            from ..services.browser_captcha_personal import BrowserCaptchaService
+            service = await BrowserCaptchaService.get_instance(db)
+            score_payload = await service.get_custom_score(
+                website_url=website_url,
+                website_key=website_key,
+                verify_url=verify_url,
+                action=action,
+                enterprise=enterprise
+            )
+            if isinstance(score_payload, dict):
+                token_value = score_payload.get("token")
+                verify_elapsed_ms = int(score_payload.get("verify_elapsed_ms") or 0)
+                verify_http_status = score_payload.get("verify_http_status")
+                verify_result = score_payload.get("verify_result") if isinstance(score_payload.get("verify_result"), dict) else {}
+                verify_mode = score_payload.get("verify_mode") or "browser_page"
+                score_token_elapsed = score_payload.get("token_elapsed_ms")
+                if isinstance(score_token_elapsed, (int, float)):
+                    token_elapsed_ms = int(score_token_elapsed)
+            if token_value:
+                fingerprint = service.get_last_fingerprint()
+                verify_proxy_used = bool(browser_proxy_enabled and browser_proxy_url)
+                verify_proxy_source = "captcha_browser_proxy" if verify_proxy_used else "browser_direct"
+                verify_proxy_url = browser_proxy_url if verify_proxy_used else ""
+        elif captcha_method == "remote_browser":
+            score_payload = await _score_test_with_remote_browser_service(
+                website_url=website_url,
+                website_key=website_key,
+                verify_url=verify_url,
+                action=action,
+                enterprise=enterprise,
+            )
+            if isinstance(score_payload, dict):
+                if score_payload.get("success") is False:
+                    raise RuntimeError(score_payload.get("message") or "远程打码分数测试失败")
+                token_value = score_payload.get("token")
+                verify_elapsed_ms = int(score_payload.get("verify_elapsed_ms") or 0)
+                verify_http_status = score_payload.get("verify_http_status")
+                verify_result = score_payload.get("verify_result") if isinstance(score_payload.get("verify_result"), dict) else {}
+                verify_mode = score_payload.get("verify_mode") or "remote_browser_page"
+                score_token_elapsed = score_payload.get("token_elapsed_ms")
+                if isinstance(score_token_elapsed, (int, float)):
+                    token_elapsed_ms = int(score_token_elapsed)
+                fingerprint = score_payload.get("fingerprint") if isinstance(score_payload.get("fingerprint"), dict) else None
+        elif captcha_method in SUPPORTED_API_CAPTCHA_METHODS:
+            token_value = await _solve_recaptcha_with_api_service(
+                method=captcha_method,
+                website_url=website_url,
+                website_key=website_key,
+                action=action,
+                enterprise=enterprise
+            )
+        else:
+            return {
+                "success": False,
+                "message": f"当前打码方式不支持分数测试: {captcha_method}",
+                "captcha_method": captcha_method,
+                "website_url": website_url,
+                "website_key": website_key,
+                "action": action,
+                "verify_url": verify_url,
+                "enterprise": enterprise,
+                "token_acquired": False,
+                "elapsed_ms": int((time.time() - started_at) * 1000)
+            }
+        if token_elapsed_ms <= 0:
+            token_elapsed_ms = int((time.time() - token_start) * 1000)
+
+        # 远程有头打码的 custom-score 可能由页面内直接完成校验，
+        # 在部分实现里不会显式回传 token，本地按 verify_result 兜底判定。
+        if captcha_method == "remote_browser" and not token_value and isinstance(verify_result, dict):
+            if verify_result.get("success") is True:
+                token_value = verify_result.get("token") or verify_result.get("gRecaptchaResponse") or "__verified_by_remote__"
+
+        if not token_value:
+            return {
+                "success": False,
+                "message": "未获取到 reCAPTCHA token",
+                "captcha_method": captcha_method,
+                "website_url": website_url,
+                "website_key": website_key,
+                "action": action,
+                "verify_url": verify_url,
+                "enterprise": enterprise,
+                "token_acquired": False,
+                "token_elapsed_ms": token_elapsed_ms,
+                "browser_proxy_enabled": browser_proxy_enabled,
+                "browser_proxy_url": browser_proxy_url if browser_proxy_enabled else "",
+                "fingerprint": fingerprint,
+                "elapsed_ms": int((time.time() - started_at) * 1000)
+            }
+
+        if verify_mode == "server_post" and not page_verify_only:
+            verify_start = time.time()
+            verify_headers = {
+                "accept": "application/json, text/javascript, */*; q=0.01",
+                "content-type": "application/json",
+                "origin": "https://antcpt.com",
+                "referer": website_url,
+                "x-requested-with": "XMLHttpRequest",
+            }
+            if isinstance(fingerprint, dict):
+                ua = (fingerprint.get("user_agent") or "").strip()
+                lang = (fingerprint.get("accept_language") or "").strip()
+                sec_ch_ua = (fingerprint.get("sec_ch_ua") or "").strip()
+                sec_ch_ua_mobile = (fingerprint.get("sec_ch_ua_mobile") or "").strip()
+                sec_ch_ua_platform = (fingerprint.get("sec_ch_ua_platform") or "").strip()
+
+                if ua:
+                    verify_headers["user-agent"] = ua
+                if lang:
+                    verify_headers["accept-language"] = lang if "," in lang else f"{lang},zh;q=0.9"
+                if sec_ch_ua:
+                    verify_headers["sec-ch-ua"] = sec_ch_ua
+                if sec_ch_ua_mobile:
+                    verify_headers["sec-ch-ua-mobile"] = sec_ch_ua_mobile
+                if sec_ch_ua_platform:
+                    verify_headers["sec-ch-ua-platform"] = sec_ch_ua_platform
+
+            if verify_headers.get("user-agent"):
+                for header_name, header_value in _guess_client_hints_from_user_agent(
+                    verify_headers.get("user-agent", "")
+                ).items():
+                    if header_value and not verify_headers.get(header_name):
+                        verify_headers[header_name] = header_value
+                verify_impersonate = _guess_impersonate_from_user_agent(verify_headers.get("user-agent", ""))
+
+            verify_proxies, verify_proxy_used, verify_proxy_source, verify_proxy_url = (
+                await _resolve_score_test_verify_proxy(
+                    captcha_method=captcha_method,
+                    browser_proxy_enabled=browser_proxy_enabled,
+                    browser_proxy_url=browser_proxy_url
+                )
+            )
+
+            async with AsyncSession() as session:
+                verify_resp = await session.post(
+                    verify_url,
+                    json={"g-recaptcha-response": token_value},
+                    headers=verify_headers,
+                    proxies=verify_proxies,
+                    impersonate=verify_impersonate,
+                    timeout=30
+                )
+            verify_elapsed_ms = int((time.time() - verify_start) * 1000)
+            verify_http_status = verify_resp.status_code
+
+            try:
+                verify_result = verify_resp.json()
+            except Exception:
+                verify_result = {"raw": verify_resp.text}
+        else:
+            verify_headers = {
+                "origin": "https://antcpt.com",
+                "referer": website_url,
+                "x-requested-with": "XMLHttpRequest",
+            }
+            if isinstance(fingerprint, dict):
+                verify_headers.update({
+                    "user-agent": fingerprint.get("user_agent", ""),
+                    "accept-language": fingerprint.get("accept_language", ""),
+                    "sec-ch-ua": fingerprint.get("sec_ch_ua", ""),
+                    "sec-ch-ua-mobile": fingerprint.get("sec_ch_ua_mobile", ""),
+                    "sec-ch-ua-platform": fingerprint.get("sec_ch_ua_platform", ""),
+                })
+
+        verify_success = bool(verify_result.get("success")) if isinstance(verify_result, dict) else False
+        score_value = verify_result.get("score") if isinstance(verify_result, dict) else None
+
+        return {
+            "success": verify_success,
+            "message": "分数校验成功" if verify_success else "分数校验未通过",
+            "captcha_method": captcha_method,
+            "website_url": website_url,
+            "website_key": website_key,
+            "action": action,
+            "verify_url": verify_url,
+            "enterprise": enterprise,
+            "token_acquired": True,
+            "token_preview": _mask_token(token_value),
+            "token_elapsed_ms": token_elapsed_ms,
+            "verify_elapsed_ms": verify_elapsed_ms,
+            "verify_http_status": verify_http_status,
+            "score": score_value,
+            "verify_result": verify_result,
+            "verify_request_meta": {
+                "mode": verify_mode,
+                "proxy_used": verify_proxy_used,
+                "user_agent": verify_headers.get("user-agent", ""),
+                "accept_language": verify_headers.get("accept-language", ""),
+                "sec_ch_ua": verify_headers.get("sec-ch-ua", ""),
+                "sec_ch_ua_mobile": verify_headers.get("sec-ch-ua-mobile", ""),
+                "sec_ch_ua_platform": verify_headers.get("sec-ch-ua-platform", ""),
+                "origin": verify_headers.get("origin", ""),
+                "referer": verify_headers.get("referer", ""),
+                "x_requested_with": verify_headers.get("x-requested-with", ""),
+                "proxy_source": verify_proxy_source,
+                "proxy_url": verify_proxy_url,
+                "impersonate": verify_impersonate,
+            },
+            "browser_proxy_enabled": browser_proxy_enabled,
+            "browser_proxy_url": browser_proxy_url if browser_proxy_enabled else "",
+            "fingerprint": fingerprint,
+            "elapsed_ms": int((time.time() - started_at) * 1000)
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"分数测试失败: {str(e)}",
+            "captcha_method": captcha_method,
+            "website_url": website_url,
+            "website_key": website_key,
+            "action": action,
+            "verify_url": verify_url,
+            "enterprise": enterprise,
+            "token_acquired": bool(token_value),
+            "token_preview": _mask_token(token_value),
+            "token_elapsed_ms": token_elapsed_ms,
+            "verify_elapsed_ms": verify_elapsed_ms,
+            "verify_http_status": verify_http_status,
+            "verify_result": verify_result,
+            "verify_request_meta": {
+                "mode": verify_mode,
+                "proxy_used": verify_proxy_used,
+                "user_agent": verify_headers.get("user-agent", ""),
+                "accept_language": verify_headers.get("accept-language", ""),
+                "sec_ch_ua": verify_headers.get("sec-ch-ua", ""),
+                "sec_ch_ua_mobile": verify_headers.get("sec-ch-ua-mobile", ""),
+                "sec_ch_ua_platform": verify_headers.get("sec-ch-ua-platform", ""),
+                "origin": verify_headers.get("origin", ""),
+                "referer": verify_headers.get("referer", ""),
+                "x_requested_with": verify_headers.get("x-requested-with", ""),
+                "proxy_source": verify_proxy_source,
+                "proxy_url": verify_proxy_url,
+                "impersonate": verify_impersonate,
+            },
+            "browser_proxy_enabled": browser_proxy_enabled,
+            "browser_proxy_url": browser_proxy_url if browser_proxy_enabled else "",
+            "fingerprint": fingerprint,
+            "elapsed_ms": int((time.time() - started_at) * 1000)
+        }
 
 
 # ========== Plugin Configuration Endpoints ==========

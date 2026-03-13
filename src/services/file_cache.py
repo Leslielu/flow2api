@@ -25,9 +25,34 @@ class FileCache:
         """
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
-        self.default_timeout = default_timeout
+        self.default_timeout = max(0, int(default_timeout))
         self.proxy_manager = proxy_manager
         self._cleanup_task = None
+
+    def _is_cleanup_disabled(self) -> bool:
+        return self.default_timeout <= 0
+
+    async def _resolve_download_proxy(self, media_type: str) -> Optional[str]:
+        """根据媒体类型解析下载代理地址。"""
+        if not self.proxy_manager:
+            return None
+
+        try:
+            # 媒体下载（图片/视频）优先使用独立的上传/下载代理
+            if media_type in ("image", "video") and hasattr(self.proxy_manager, "get_media_proxy_url"):
+                return await self.proxy_manager.get_media_proxy_url()
+
+            # 其他下载走请求代理
+            if hasattr(self.proxy_manager, "get_request_proxy_url"):
+                return await self.proxy_manager.get_request_proxy_url()
+
+            # 向后兼容旧实现
+            if hasattr(self.proxy_manager, "get_proxy_url"):
+                return await self.proxy_manager.get_proxy_url()
+        except Exception as e:
+            debug_logger.log_warning(f"Resolve download proxy failed: {str(e)}")
+
+        return None
 
     async def start_cleanup_task(self):
         """Start background cleanup task"""
@@ -62,6 +87,8 @@ class FileCache:
     async def _cleanup_expired_files(self):
         """Remove expired cache files"""
         try:
+            if self._is_cleanup_disabled():
+                return
             current_time = time.time()
             removed_count = 0
 
@@ -117,6 +144,8 @@ class FileCache:
 
         # Check if already cached and not expired
         if file_path.exists():
+            if self._is_cleanup_disabled():
+                return filename
             file_age = time.time() - file_path.stat().st_mtime
             if file_age < self.default_timeout:
                 debug_logger.log_info(f"Cache hit: {filename}")
@@ -131,12 +160,8 @@ class FileCache:
         # Download file
         debug_logger.log_info(f"Downloading file from: {url}")
 
-        # Get proxy if available
-        proxy_url = None
-        if self.proxy_manager:
-            proxy_config = await self.proxy_manager.get_proxy_config()
-            if proxy_config and proxy_config.enabled and proxy_config.proxy_url:
-                proxy_url = proxy_config.proxy_url
+        # Resolve proxy by media type
+        proxy_url = await self._resolve_download_proxy(media_type)
 
         # Try method 1: curl_cffi with browser impersonation
         try:
@@ -305,7 +330,7 @@ class FileCache:
 
     def set_timeout(self, timeout: int):
         """Set cache timeout in seconds"""
-        self.default_timeout = timeout
+        self.default_timeout = max(0, int(timeout))
         debug_logger.log_info(f"Cache timeout updated to {timeout} seconds")
 
     def get_timeout(self) -> int:

@@ -8,9 +8,10 @@ import time
 import os
 import sys
 import subprocess
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from ..core.logger import debug_logger
+from ..core.config import config
 
 
 # ==================== Docker 环境检测 ====================
@@ -34,6 +35,19 @@ def _is_running_in_docker() -> bool:
 
 
 IS_DOCKER = _is_running_in_docker()
+
+
+def _is_truthy_env(name: str) -> bool:
+    """判断环境变量是否为 true。"""
+    value = os.environ.get(name, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+ALLOW_DOCKER_HEADED = (
+    _is_truthy_env("ALLOW_DOCKER_HEADED_CAPTCHA")
+    or _is_truthy_env("ALLOW_DOCKER_BROWSER_CAPTCHA")
+)
+DOCKER_HEADED_BLOCKED = IS_DOCKER and not ALLOW_DOCKER_HEADED
 
 
 # ==================== nodriver 自动安装 ====================
@@ -102,11 +116,19 @@ def _ensure_nodriver_installed() -> bool:
 uc = None
 NODRIVER_AVAILABLE = False
 
-if IS_DOCKER:
-    debug_logger.log_warning("[BrowserCaptcha] 检测到 Docker 环境，内置浏览器打码不可用，请使用第三方打码服务")
-    print("[BrowserCaptcha] ⚠️ 检测到 Docker 环境，内置浏览器打码不可用")
-    print("[BrowserCaptcha] 请使用第三方打码服务: yescaptcha, capmonster, ezcaptcha, capsolver")
+if DOCKER_HEADED_BLOCKED:
+    debug_logger.log_warning(
+        "[BrowserCaptcha] 检测到 Docker 环境，默认禁用内置浏览器打码。"
+        "如需启用请设置 ALLOW_DOCKER_HEADED_CAPTCHA=true，并提供 DISPLAY/Xvfb。"
+    )
+    print("[BrowserCaptcha] ⚠️ 检测到 Docker 环境，默认禁用内置浏览器打码")
+    print("[BrowserCaptcha] 如需启用请设置 ALLOW_DOCKER_HEADED_CAPTCHA=true，并提供 DISPLAY/Xvfb")
 else:
+    if IS_DOCKER and ALLOW_DOCKER_HEADED:
+        debug_logger.log_warning(
+            "[BrowserCaptcha] Docker 内置浏览器打码白名单已启用，请确保 DISPLAY/Xvfb 可用"
+        )
+        print("[BrowserCaptcha] ✅ Docker 内置浏览器打码白名单已启用")
     if _ensure_nodriver_installed():
         try:
             import nodriver as uc
@@ -155,6 +177,11 @@ class BrowserCaptchaService:
         self.resident_tab = None                         # 向后兼容
         self._running = False                            # 向后兼容
         self._recaptcha_ready = False                    # 向后兼容
+        self._last_fingerprint: Optional[Dict[str, Any]] = None
+        self._resident_error_streaks: dict[str, int] = {}
+        # 自定义站点打码常驻页（用于 score-test）
+        self._custom_tabs: dict[str, Dict[str, Any]] = {}
+        self._custom_lock = asyncio.Lock()
 
     @classmethod
     async def get_instance(cls, db=None) -> 'BrowserCaptchaService':
@@ -167,10 +194,15 @@ class BrowserCaptchaService:
     
     def _check_available(self):
         """检查服务是否可用"""
-        if IS_DOCKER:
+        if DOCKER_HEADED_BLOCKED:
             raise RuntimeError(
-                "内置浏览器打码在 Docker 环境中不可用。"
-                "请使用第三方打码服务: yescaptcha, capmonster, ezcaptcha, capsolver"
+                "检测到 Docker 环境，默认禁用内置浏览器打码。"
+                "如需启用请设置环境变量 ALLOW_DOCKER_HEADED_CAPTCHA=true，并提供 DISPLAY/Xvfb。"
+            )
+        if IS_DOCKER and not os.environ.get("DISPLAY"):
+            raise RuntimeError(
+                "Docker 内置浏览器打码已启用，但 DISPLAY 未设置。"
+                "请设置 DISPLAY（例如 :99）并启动 Xvfb。"
             )
         if not NODRIVER_AVAILABLE or uc is None:
             raise RuntimeError(
@@ -202,10 +234,17 @@ class BrowserCaptchaService:
             # 确保 user_data_dir 存在
             os.makedirs(self.user_data_dir, exist_ok=True)
 
+            browser_executable_path = os.environ.get("BROWSER_EXECUTABLE_PATH", "").strip() or None
+            if browser_executable_path:
+                debug_logger.log_info(
+                    f"[BrowserCaptcha] 使用指定浏览器可执行文件: {browser_executable_path}"
+                )
+
             # 启动 nodriver 浏览器
             self.browser = await uc.start(
                 headless=self.headless,
                 user_data_dir=self.user_data_dir,
+                browser_executable_path=browser_executable_path,
                 sandbox=False,  # nodriver 需要此参数来禁用 sandbox
                 browser_args=[
                     '--no-sandbox',
@@ -295,6 +334,7 @@ class BrowserCaptchaService:
             if project_id:
                 # 关闭指定的常驻标签页
                 await self._close_resident_tab(project_id)
+                self._resident_error_streaks.pop(project_id, None)
                 debug_logger.log_info(f"[BrowserCaptcha] 已关闭 project_id={project_id} 的常驻模式")
             else:
                 # 关闭所有常驻标签页
@@ -306,6 +346,7 @@ class BrowserCaptchaService:
                             await resident_info.tab.close()
                         except Exception:
                             pass
+                self._resident_error_streaks.clear()
                 debug_logger.log_info(f"[BrowserCaptcha] 已关闭所有常驻标签页 (共 {len(project_ids)} 个)")
         
         # 向后兼容：清理旧属性
@@ -322,6 +363,216 @@ class BrowserCaptchaService:
         
         self.resident_project_id = None
         self._recaptcha_ready = False
+
+    async def _wait_for_document_ready(self, tab, retries: int = 30, interval_seconds: float = 1.0) -> bool:
+        """等待页面文档加载完成。"""
+        for _ in range(retries):
+            try:
+                ready_state = await tab.evaluate("document.readyState")
+                if ready_state == "complete":
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(interval_seconds)
+        return False
+
+    def _is_server_side_flow_error(self, error_text: str) -> bool:
+        error_lower = (error_text or "").lower()
+        return any(keyword in error_lower for keyword in [
+            "http error 500",
+            "public_error",
+            "internal error",
+            "reason=internal",
+            "reason: internal",
+            "\"reason\":\"internal\"",
+            "server error",
+            "upstream error",
+        ])
+
+    async def _clear_tab_site_storage(self, tab) -> Dict[str, Any]:
+        """清理当前站点的本地存储状态，但保留 cookies 登录态。"""
+        result = await tab.evaluate("""
+            (async () => {
+                const summary = {
+                    local_storage_cleared: false,
+                    session_storage_cleared: false,
+                    cache_storage_deleted: [],
+                    indexed_db_deleted: [],
+                    indexed_db_errors: [],
+                    service_worker_unregistered: 0,
+                };
+
+                try {
+                    window.localStorage.clear();
+                    summary.local_storage_cleared = true;
+                } catch (e) {
+                    summary.local_storage_error = String(e);
+                }
+
+                try {
+                    window.sessionStorage.clear();
+                    summary.session_storage_cleared = true;
+                } catch (e) {
+                    summary.session_storage_error = String(e);
+                }
+
+                try {
+                    if (typeof caches !== 'undefined') {
+                        const cacheKeys = await caches.keys();
+                        for (const key of cacheKeys) {
+                            const deleted = await caches.delete(key);
+                            if (deleted) {
+                                summary.cache_storage_deleted.push(key);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    summary.cache_storage_error = String(e);
+                }
+
+                try {
+                    if (navigator.serviceWorker) {
+                        const registrations = await navigator.serviceWorker.getRegistrations();
+                        for (const registration of registrations) {
+                            const ok = await registration.unregister();
+                            if (ok) {
+                                summary.service_worker_unregistered += 1;
+                            }
+                        }
+                    }
+                } catch (e) {
+                    summary.service_worker_error = String(e);
+                }
+
+                try {
+                    if (typeof indexedDB !== 'undefined' && typeof indexedDB.databases === 'function') {
+                        const dbs = await indexedDB.databases();
+                        const names = Array.from(new Set(
+                            dbs
+                                .map((item) => item && item.name)
+                                .filter((name) => typeof name === 'string' && name)
+                        ));
+                        for (const name of names) {
+                            try {
+                                await new Promise((resolve) => {
+                                    const request = indexedDB.deleteDatabase(name);
+                                    request.onsuccess = () => resolve(true);
+                                    request.onerror = () => resolve(false);
+                                    request.onblocked = () => resolve(false);
+                                });
+                                summary.indexed_db_deleted.push(name);
+                            } catch (e) {
+                                summary.indexed_db_errors.push(`${name}: ${String(e)}`);
+                            }
+                        }
+                    } else {
+                        summary.indexed_db_unsupported = true;
+                    }
+                } catch (e) {
+                    summary.indexed_db_errors.push(String(e));
+                }
+
+                return summary;
+            })()
+        """)
+        return result if isinstance(result, dict) else {}
+
+    async def _clear_resident_storage_and_reload(self, project_id: str) -> bool:
+        """清理常驻标签页的站点数据并刷新，尝试原地自愈。"""
+        async with self._resident_lock:
+            resident_info = self._resident_tabs.get(project_id)
+
+        if not resident_info or not resident_info.tab:
+            debug_logger.log_warning(f"[BrowserCaptcha] project_id={project_id} 没有可清理的常驻标签页")
+            return False
+
+        try:
+            cleanup_summary = await self._clear_tab_site_storage(resident_info.tab)
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] project_id={project_id} 已清理站点存储，准备刷新恢复: {cleanup_summary}"
+            )
+        except Exception as e:
+            debug_logger.log_warning(f"[BrowserCaptcha] project_id={project_id} 清理站点存储失败: {e}")
+            return False
+
+        try:
+            resident_info.recaptcha_ready = False
+            await resident_info.tab.reload()
+        except Exception as e:
+            debug_logger.log_warning(f"[BrowserCaptcha] project_id={project_id} 清理后刷新标签页失败: {e}")
+            return False
+
+        if not await self._wait_for_document_ready(resident_info.tab, retries=30, interval_seconds=1.0):
+            debug_logger.log_warning(f"[BrowserCaptcha] project_id={project_id} 清理后页面加载超时")
+            return False
+
+        resident_info.recaptcha_ready = await self._wait_for_recaptcha(resident_info.tab)
+        if resident_info.recaptcha_ready:
+            debug_logger.log_warning(f"[BrowserCaptcha] project_id={project_id} 清理后已恢复 reCAPTCHA")
+            return True
+
+        debug_logger.log_warning(f"[BrowserCaptcha] project_id={project_id} 清理后仍无法恢复 reCAPTCHA")
+        return False
+
+    async def _recreate_resident_tab(self, project_id: str) -> bool:
+        """关闭并重建常驻标签页。"""
+        async with self._resident_lock:
+            await self._close_resident_tab(project_id)
+            resident_info = await self._create_resident_tab(project_id)
+            if resident_info is None:
+                debug_logger.log_warning(f"[BrowserCaptcha] project_id={project_id} 重建常驻标签页失败")
+                return False
+            self._resident_tabs[project_id] = resident_info
+            debug_logger.log_warning(f"[BrowserCaptcha] project_id={project_id} 已重建常驻标签页")
+            return True
+
+    async def _restart_browser_for_project(self, project_id: str) -> bool:
+        """重启整个 nodriver 浏览器，并恢复指定 project 的常驻标签页。"""
+        debug_logger.log_warning(f"[BrowserCaptcha] project_id={project_id} 准备重启 nodriver 浏览器以恢复")
+        await self.close()
+        await self.initialize()
+
+        async with self._resident_lock:
+            resident_info = await self._create_resident_tab(project_id)
+            if resident_info is None:
+                debug_logger.log_warning(f"[BrowserCaptcha] project_id={project_id} 浏览器重启后恢复常驻标签页失败")
+                return False
+            self._resident_tabs[project_id] = resident_info
+            debug_logger.log_warning(f"[BrowserCaptcha] project_id={project_id} 浏览器重启后已恢复常驻标签页")
+            return True
+
+    async def report_flow_error(self, project_id: str, error_reason: str, error_message: str = ""):
+        """上游生成接口异常时，对常驻标签页执行自愈恢复。"""
+        if not project_id:
+            return
+
+        streak = self._resident_error_streaks.get(project_id, 0) + 1
+        self._resident_error_streaks[project_id] = streak
+        error_text = f"{error_reason or ''} {error_message or ''}".strip()
+        debug_logger.log_warning(
+            f"[BrowserCaptcha] project_id={project_id} 收到上游异常，streak={streak}, reason={error_reason}, detail={error_message[:200]}"
+        )
+
+        if not self._initialized or not self.browser:
+            return
+
+        if self._is_server_side_flow_error(error_text):
+            recreate_threshold = max(2, int(getattr(config, "browser_personal_recreate_threshold", 2) or 2))
+            restart_threshold = max(3, int(getattr(config, "browser_personal_restart_threshold", 3) or 3))
+
+            if streak >= restart_threshold:
+                await self._restart_browser_for_project(project_id)
+                return
+            if streak >= recreate_threshold:
+                await self._recreate_resident_tab(project_id)
+                return
+
+            healed = await self._clear_resident_storage_and_reload(project_id)
+            if not healed:
+                await self._recreate_resident_tab(project_id)
+            return
+
+        await self._recreate_resident_tab(project_id)
 
     async def _wait_for_recaptcha(self, tab) -> bool:
         """等待 reCAPTCHA 加载
@@ -368,6 +619,51 @@ class BrowserCaptchaService:
             await tab.sleep(0.5)
         
         debug_logger.log_warning("[BrowserCaptcha] reCAPTCHA 加载超时")
+        return False
+
+    async def _wait_for_custom_recaptcha(
+        self,
+        tab,
+        website_key: str,
+        enterprise: bool = False,
+    ) -> bool:
+        """等待任意站点的 reCAPTCHA 加载，用于分数测试。"""
+        debug_logger.log_info("[BrowserCaptcha] 检测自定义 reCAPTCHA...")
+
+        ready_check = (
+            "typeof grecaptcha !== 'undefined' && typeof grecaptcha.enterprise !== 'undefined' && "
+            "typeof grecaptcha.enterprise.execute === 'function'"
+        ) if enterprise else (
+            "typeof grecaptcha !== 'undefined' && typeof grecaptcha.execute === 'function'"
+        )
+        script_path = "recaptcha/enterprise.js" if enterprise else "recaptcha/api.js"
+        label = "Enterprise" if enterprise else "V3"
+
+        is_ready = await tab.evaluate(ready_check)
+        if is_ready:
+            debug_logger.log_info(f"[BrowserCaptcha] 自定义 reCAPTCHA {label} 已加载")
+            return True
+
+        debug_logger.log_info("[BrowserCaptcha] 未检测到自定义 reCAPTCHA，注入脚本...")
+        await tab.evaluate(f"""
+            (() => {{
+                if (document.querySelector('script[src*="recaptcha"]')) return;
+                const script = document.createElement('script');
+                script.src = 'https://www.google.com/{script_path}?render={website_key}';
+                script.async = true;
+                document.head.appendChild(script);
+            }})()
+        """)
+
+        await tab.sleep(3)
+        for i in range(20):
+            is_ready = await tab.evaluate(ready_check)
+            if is_ready:
+                debug_logger.log_info(f"[BrowserCaptcha] 自定义 reCAPTCHA {label} 已加载（等待了 {i * 0.5} 秒）")
+                return True
+            await tab.sleep(0.5)
+
+        debug_logger.log_warning("[BrowserCaptcha] 自定义 reCAPTCHA 加载超时")
         return False
 
     async def _execute_recaptcha_on_tab(self, tab, action: str = "IMAGE_GENERATION") -> Optional[str]:
@@ -429,6 +725,239 @@ class BrowserCaptchaService:
         
         return token
 
+    async def _execute_custom_recaptcha_on_tab(
+        self,
+        tab,
+        website_key: str,
+        action: str = "homepage",
+        enterprise: bool = False,
+    ) -> Optional[str]:
+        """在指定标签页执行任意站点的 reCAPTCHA。"""
+        ts = int(time.time() * 1000)
+        token_var = f"_custom_recaptcha_token_{ts}"
+        error_var = f"_custom_recaptcha_error_{ts}"
+        execute_target = "grecaptcha.enterprise.execute" if enterprise else "grecaptcha.execute"
+
+        execute_script = f"""
+            (() => {{
+                window.{token_var} = null;
+                window.{error_var} = null;
+
+                try {{
+                    grecaptcha.ready(function() {{
+                        {execute_target}('{website_key}', {{action: '{action}'}})
+                            .then(function(token) {{
+                                window.{token_var} = token;
+                            }})
+                            .catch(function(err) {{
+                                window.{error_var} = err.message || 'execute failed';
+                            }});
+                    }});
+                }} catch (e) {{
+                    window.{error_var} = e.message || 'exception';
+                }}
+            }})()
+        """
+
+        await tab.evaluate(execute_script)
+
+        token = None
+        for _ in range(30):
+            await tab.sleep(0.5)
+            token = await tab.evaluate(f"window.{token_var}")
+            if token:
+                break
+            error = await tab.evaluate(f"window.{error_var}")
+            if error:
+                debug_logger.log_error(f"[BrowserCaptcha] 自定义 reCAPTCHA 错误: {error}")
+                break
+
+        try:
+            await tab.evaluate(f"delete window.{token_var}; delete window.{error_var};")
+        except:
+            pass
+
+        if token:
+            post_wait_seconds = 3
+            try:
+                post_wait_seconds = float(getattr(config, "browser_recaptcha_settle_seconds", 3) or 3)
+            except Exception:
+                pass
+            if post_wait_seconds > 0:
+                debug_logger.log_info(
+                    f"[BrowserCaptcha] 自定义 reCAPTCHA 已完成，额外等待 {post_wait_seconds:.1f}s 后返回 token"
+                )
+                await tab.sleep(post_wait_seconds)
+
+        return token
+
+    async def _verify_score_on_tab(self, tab, token: str, verify_url: str) -> Dict[str, Any]:
+        """直接读取测试页面展示的分数，避免 verify.php 与页面显示口径不一致。"""
+        _ = token
+        _ = verify_url
+        started_at = time.time()
+        timeout_seconds = 25.0
+        refresh_clicked = False
+        last_snapshot: Dict[str, Any] = {}
+
+        try:
+            timeout_seconds = float(getattr(config, "browser_score_dom_wait_seconds", 25) or 25)
+        except Exception:
+            pass
+
+        while (time.time() - started_at) < timeout_seconds:
+            try:
+                result = await tab.evaluate("""
+                    (() => {
+                        const bodyText = ((document.body && document.body.innerText) || "")
+                            .replace(/\\u00a0/g, " ")
+                            .replace(/\\r/g, "");
+                        const patterns = [
+                            { source: "current_score", regex: /Your score is:\\s*([01](?:\\.\\d+)?)/i },
+                            { source: "selected_score", regex: /Selected Score Test:[\\s\\S]{0,400}?Score:\\s*([01](?:\\.\\d+)?)/i },
+                            { source: "history_score", regex: /(?:^|\\n)\\s*Score:\\s*([01](?:\\.\\d+)?)\\s*;/i },
+                        ];
+                        let score = null;
+                        let source = "";
+                        for (const item of patterns) {
+                            const match = bodyText.match(item.regex);
+                            if (!match) continue;
+                            const parsed = Number(match[1]);
+                            if (!Number.isNaN(parsed) && parsed >= 0 && parsed <= 1) {
+                                score = parsed;
+                                source = item.source;
+                                break;
+                            }
+                        }
+                        const uaMatch = bodyText.match(/Current User Agent:\\s*([^\\n]+)/i);
+                        const ipMatch = bodyText.match(/Current IP Address:\\s*([^\\n]+)/i);
+                        return {
+                            score,
+                            source,
+                            raw_text: bodyText.slice(0, 4000),
+                            current_user_agent: uaMatch ? uaMatch[1].trim() : "",
+                            current_ip_address: ipMatch ? ipMatch[1].trim() : "",
+                            title: document.title || "",
+                            url: location.href || "",
+                        };
+                    })()
+                """)
+            except Exception as e:
+                result = {"error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+            if isinstance(result, dict):
+                last_snapshot = result
+                score = result.get("score")
+                if isinstance(score, (int, float)):
+                    elapsed_ms = int((time.time() - started_at) * 1000)
+                    return {
+                        "verify_mode": "browser_page_dom",
+                        "verify_elapsed_ms": elapsed_ms,
+                        "verify_http_status": None,
+                        "verify_result": {
+                            "success": True,
+                            "score": score,
+                            "source": result.get("source") or "antcpt_dom",
+                            "raw_text": result.get("raw_text") or "",
+                            "current_user_agent": result.get("current_user_agent") or "",
+                            "current_ip_address": result.get("current_ip_address") or "",
+                            "page_title": result.get("title") or "",
+                            "page_url": result.get("url") or "",
+                        },
+                    }
+
+            if not refresh_clicked and (time.time() - started_at) >= 2:
+                refresh_clicked = True
+                try:
+                    await tab.evaluate("""
+                        (() => {
+                            const nodes = Array.from(
+                                document.querySelectorAll('button, input[type="button"], input[type="submit"], a')
+                            );
+                            const target = nodes.find((node) => {
+                                const text = (node.innerText || node.textContent || node.value || "").trim();
+                                return /Refresh score now!?/i.test(text);
+                            });
+                            if (target) {
+                                target.click();
+                                return true;
+                            }
+                            return false;
+                        })()
+                    """)
+                except Exception:
+                    pass
+
+            await tab.sleep(0.5)
+
+        elapsed_ms = int((time.time() - started_at) * 1000)
+        if not isinstance(last_snapshot, dict):
+            last_snapshot = {"raw": last_snapshot}
+
+        return {
+            "verify_mode": "browser_page_dom",
+            "verify_elapsed_ms": elapsed_ms,
+            "verify_http_status": None,
+            "verify_result": {
+                "success": False,
+                "score": None,
+                "source": "antcpt_dom_timeout",
+                "raw_text": last_snapshot.get("raw_text") or "",
+                "current_user_agent": last_snapshot.get("current_user_agent") or "",
+                "current_ip_address": last_snapshot.get("current_ip_address") or "",
+                "page_title": last_snapshot.get("title") or "",
+                "page_url": last_snapshot.get("url") or "",
+                "error": last_snapshot.get("error") or "未在页面中读取到分数",
+            },
+        }
+
+    async def _extract_tab_fingerprint(self, tab) -> Optional[Dict[str, Any]]:
+        """从 nodriver 标签页提取浏览器指纹信息。"""
+        try:
+            fingerprint = await tab.evaluate("""
+                () => {
+                    const ua = navigator.userAgent || "";
+                    const lang = navigator.language || "";
+                    const uaData = navigator.userAgentData || null;
+                    let secChUa = "";
+                    let secChUaMobile = "";
+                    let secChUaPlatform = "";
+
+                    if (uaData) {
+                        if (Array.isArray(uaData.brands) && uaData.brands.length > 0) {
+                            secChUa = uaData.brands
+                                .map((item) => `"${item.brand}";v="${item.version}"`)
+                                .join(", ");
+                        }
+                        secChUaMobile = uaData.mobile ? "?1" : "?0";
+                        if (uaData.platform) {
+                            secChUaPlatform = `"${uaData.platform}"`;
+                        }
+                    }
+
+                    return {
+                        user_agent: ua,
+                        accept_language: lang,
+                        sec_ch_ua: secChUa,
+                        sec_ch_ua_mobile: secChUaMobile,
+                        sec_ch_ua_platform: secChUaPlatform,
+                    };
+                }
+            """)
+            if not isinstance(fingerprint, dict):
+                return None
+
+            # personal 模式当前未单独配置浏览器代理，显式使用直连，避免与全局代理混淆。
+            result: Dict[str, Any] = {"proxy_url": None}
+            for key in ("user_agent", "accept_language", "sec_ch_ua", "sec_ch_ua_mobile", "sec_ch_ua_platform"):
+                value = fingerprint.get(key)
+                if isinstance(value, str) and value:
+                    result[key] = value
+            return result
+        except Exception as e:
+            debug_logger.log_warning(f"[BrowserCaptcha] 提取 nodriver 指纹失败: {e}")
+            return None
+
     # ========== 主要 API ==========
 
     async def get_token(self, project_id: str, action: str = "IMAGE_GENERATION") -> Optional[str]:
@@ -447,6 +976,7 @@ class BrowserCaptchaService:
         """
         # 确保浏览器已初始化
         await self.initialize()
+        self._last_fingerprint = None
         
         # 尝试从常驻标签页获取 token
         async with self._resident_lock:
@@ -470,6 +1000,8 @@ class BrowserCaptchaService:
                 token = await self._execute_recaptcha_on_tab(resident_info.tab, action)
                 duration_ms = (time.time() - start_time) * 1000
                 if token:
+                    self._resident_error_streaks.pop(project_id, None)
+                    self._last_fingerprint = await self._extract_tab_fingerprint(resident_info.tab)
                     debug_logger.log_info(f"[BrowserCaptcha] ✅ Token生成成功（耗时 {duration_ms:.0f}ms）")
                     return token
                 else:
@@ -487,6 +1019,8 @@ class BrowserCaptchaService:
                     try:
                         token = await self._execute_recaptcha_on_tab(resident_info.tab, action)
                         if token:
+                            self._resident_error_streaks.pop(project_id, None)
+                            self._last_fingerprint = await self._extract_tab_fingerprint(resident_info.tab)
                             debug_logger.log_info(f"[BrowserCaptcha] ✅ 重建后 Token生成成功")
                             return token
                     except Exception:
@@ -494,7 +1028,10 @@ class BrowserCaptchaService:
         
         # 最终 Fallback: 使用传统模式
         debug_logger.log_warning(f"[BrowserCaptcha] 所有常驻方式失败，fallback 到传统模式 (project: {project_id})")
-        return await self._get_token_legacy(project_id, action)
+        legacy_token = await self._get_token_legacy(project_id, action)
+        if legacy_token:
+            self._resident_error_streaks.pop(project_id, None)
+        return legacy_token
 
     async def _create_resident_tab(self, project_id: str) -> Optional[ResidentTabInfo]:
         """为指定 project_id 创建常驻标签页
@@ -621,6 +1158,7 @@ class BrowserCaptchaService:
             duration_ms = (time.time() - start_time) * 1000
 
             if token:
+                self._last_fingerprint = await self._extract_tab_fingerprint(tab)
                 debug_logger.log_info(f"[BrowserCaptcha] [Legacy] ✅ Token获取成功（耗时 {duration_ms:.0f}ms）")
                 return token
             else:
@@ -638,12 +1176,28 @@ class BrowserCaptchaService:
                 except Exception:
                     pass
 
+    def get_last_fingerprint(self) -> Optional[Dict[str, Any]]:
+        """返回最近一次打码时的浏览器指纹快照。"""
+        if not self._last_fingerprint:
+            return None
+        return dict(self._last_fingerprint)
+
     async def close(self):
         """关闭浏览器"""
         # 先停止所有常驻模式（关闭所有常驻标签页）
         await self.stop_resident_mode()
         
         try:
+            custom_items = list(self._custom_tabs.values())
+            self._custom_tabs.clear()
+            for item in custom_items:
+                tab = item.get("tab") if isinstance(item, dict) else None
+                if tab:
+                    try:
+                        await tab.close()
+                    except Exception:
+                        pass
+
             if self.browser:
                 try:
                     self.browser.stop()
@@ -654,6 +1208,7 @@ class BrowserCaptchaService:
 
             self._initialized = False
             self._resident_tabs.clear()  # 确保清空常驻字典
+            self._resident_error_streaks.clear()
             debug_logger.log_info("[BrowserCaptcha] 浏览器已关闭")
         except Exception as e:
             debug_logger.log_error(f"[BrowserCaptcha] 关闭浏览器异常: {str(e)}")
@@ -799,3 +1354,210 @@ class BrowserCaptchaService:
         if self._resident_tabs:
             return next(iter(self._resident_tabs.keys()))
         return self.resident_project_id
+
+    async def get_custom_token(
+        self,
+        website_url: str,
+        website_key: str,
+        action: str = "homepage",
+        enterprise: bool = False,
+    ) -> Optional[str]:
+        """为任意站点执行 reCAPTCHA，用于分数测试等场景。
+
+        与普通 legacy 模式不同，这里会复用同一个常驻标签页，避免每次冷启动新 tab。
+        """
+        await self.initialize()
+        self._last_fingerprint = None
+
+        cache_key = f"{website_url}|{website_key}|{1 if enterprise else 0}"
+        warmup_seconds = float(getattr(config, "browser_score_test_warmup_seconds", 12) or 12)
+        per_request_settle_seconds = float(
+            getattr(config, "browser_score_test_settle_seconds", 2.5) or 2.5
+        )
+        max_retries = 2
+
+        async with self._custom_lock:
+            for attempt in range(max_retries):
+                start_time = time.time()
+                custom_info = self._custom_tabs.get(cache_key)
+                tab = custom_info.get("tab") if isinstance(custom_info, dict) else None
+
+                try:
+                    if tab is None:
+                        debug_logger.log_info(f"[BrowserCaptcha] [Custom] 创建常驻测试标签页: {website_url}")
+                        tab = await self.browser.get(website_url, new_tab=True)
+                        custom_info = {
+                            "tab": tab,
+                            "recaptcha_ready": False,
+                            "warmed_up": False,
+                            "created_at": time.time(),
+                        }
+                        self._custom_tabs[cache_key] = custom_info
+
+                    page_loaded = False
+                    for _ in range(20):
+                        ready_state = await tab.evaluate("document.readyState")
+                        if ready_state == "complete":
+                            page_loaded = True
+                            break
+                        await tab.sleep(0.5)
+
+                    if not page_loaded:
+                        raise RuntimeError("自定义页面加载超时")
+
+                    if not custom_info.get("recaptcha_ready"):
+                        recaptcha_ready = await self._wait_for_custom_recaptcha(
+                            tab=tab,
+                            website_key=website_key,
+                            enterprise=enterprise,
+                        )
+                        if not recaptcha_ready:
+                            raise RuntimeError("自定义 reCAPTCHA 无法加载")
+                        custom_info["recaptcha_ready"] = True
+
+                    try:
+                        await tab.evaluate("""
+                            (() => {
+                                try {
+                                    const body = document.body || document.documentElement;
+                                    const width = window.innerWidth || 1280;
+                                    const height = window.innerHeight || 720;
+                                    const x = Math.max(24, Math.floor(width * 0.38));
+                                    const y = Math.max(24, Math.floor(height * 0.32));
+                                    const moveEvent = new MouseEvent('mousemove', {
+                                        bubbles: true,
+                                        clientX: x,
+                                        clientY: y
+                                    });
+                                    const overEvent = new MouseEvent('mouseover', {
+                                        bubbles: true,
+                                        clientX: x,
+                                        clientY: y
+                                    });
+                                    window.focus();
+                                    window.dispatchEvent(new Event('focus'));
+                                    document.dispatchEvent(moveEvent);
+                                    document.dispatchEvent(overEvent);
+                                    if (body) {
+                                        body.dispatchEvent(moveEvent);
+                                        body.dispatchEvent(overEvent);
+                                    }
+                                    window.scrollTo(0, Math.min(320, document.body?.scrollHeight || 320));
+                                } catch (e) {}
+                            })()
+                        """)
+                    except Exception:
+                        pass
+
+                    if not custom_info.get("warmed_up"):
+                        if warmup_seconds > 0:
+                            debug_logger.log_info(
+                                f"[BrowserCaptcha] [Custom] 首次预热测试页面 {warmup_seconds:.1f}s 后再执行 token"
+                            )
+                            try:
+                                await tab.evaluate("""
+                                    (() => {
+                                        try {
+                                            window.scrollTo(0, Math.min(240, document.body.scrollHeight || 240));
+                                            window.dispatchEvent(new Event('mousemove'));
+                                            window.dispatchEvent(new Event('focus'));
+                                        } catch (e) {}
+                                    })()
+                                """)
+                            except Exception:
+                                pass
+                            await tab.sleep(warmup_seconds)
+                        custom_info["warmed_up"] = True
+                    elif per_request_settle_seconds > 0:
+                        debug_logger.log_info(
+                            f"[BrowserCaptcha] [Custom] 复用测试标签页，执行前额外等待 {per_request_settle_seconds:.1f}s"
+                        )
+                        await tab.sleep(per_request_settle_seconds)
+
+                    debug_logger.log_info(f"[BrowserCaptcha] [Custom] 使用常驻测试标签页执行验证 (action: {action})...")
+                    token = await self._execute_custom_recaptcha_on_tab(
+                        tab=tab,
+                        website_key=website_key,
+                        action=action,
+                        enterprise=enterprise,
+                    )
+
+                    duration_ms = (time.time() - start_time) * 1000
+                    if token:
+                        extracted_fingerprint = await self._extract_tab_fingerprint(tab)
+                        if not extracted_fingerprint:
+                            try:
+                                fallback_ua = await tab.evaluate("navigator.userAgent || ''")
+                                fallback_lang = await tab.evaluate("navigator.language || ''")
+                                extracted_fingerprint = {
+                                    "user_agent": fallback_ua or "",
+                                    "accept_language": fallback_lang or "",
+                                    "proxy_url": None,
+                                }
+                            except Exception:
+                                extracted_fingerprint = None
+                        self._last_fingerprint = extracted_fingerprint
+                        debug_logger.log_info(
+                            f"[BrowserCaptcha] [Custom] ✅ 常驻测试标签页 Token获取成功（耗时 {duration_ms:.0f}ms）"
+                        )
+                        return token
+
+                    raise RuntimeError("自定义 token 获取失败（返回 null）")
+                except Exception as e:
+                    debug_logger.log_warning(
+                        f"[BrowserCaptcha] [Custom] 尝试 {attempt + 1}/{max_retries} 失败: {str(e)}"
+                    )
+                    stale_info = self._custom_tabs.pop(cache_key, None)
+                    stale_tab = stale_info.get("tab") if isinstance(stale_info, dict) else None
+                    if stale_tab:
+                        try:
+                            await stale_tab.close()
+                        except Exception:
+                            pass
+                    if attempt >= max_retries - 1:
+                        debug_logger.log_error(f"[BrowserCaptcha] [Custom] 获取token异常: {str(e)}")
+                        return None
+
+            return None
+
+    async def get_custom_score(
+        self,
+        website_url: str,
+        website_key: str,
+        verify_url: str,
+        action: str = "homepage",
+        enterprise: bool = False,
+    ) -> Dict[str, Any]:
+        """在同一个常驻标签页里获取 token 并直接校验页面分数。"""
+        token_started_at = time.time()
+        token = await self.get_custom_token(
+            website_url=website_url,
+            website_key=website_key,
+            action=action,
+            enterprise=enterprise,
+        )
+        token_elapsed_ms = int((time.time() - token_started_at) * 1000)
+
+        if not token:
+            return {
+                "token": None,
+                "token_elapsed_ms": token_elapsed_ms,
+                "verify_mode": "browser_page",
+                "verify_elapsed_ms": 0,
+                "verify_http_status": None,
+                "verify_result": {},
+            }
+
+        cache_key = f"{website_url}|{website_key}|{1 if enterprise else 0}"
+        async with self._custom_lock:
+            custom_info = self._custom_tabs.get(cache_key)
+            tab = custom_info.get("tab") if isinstance(custom_info, dict) else None
+            if tab is None:
+                raise RuntimeError("页面分数测试标签页不存在")
+            verify_payload = await self._verify_score_on_tab(tab, token, verify_url)
+
+        return {
+            "token": token,
+            "token_elapsed_ms": token_elapsed_ms,
+            **verify_payload,
+        }
