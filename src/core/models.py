@@ -156,6 +156,7 @@ class CaptchaConfig(BaseModel):
     """Captcha configuration"""
     id: int = 1
     captcha_method: str = "browser"  # yescaptcha/capmonster/ezcaptcha/capsolver/browser/personal/remote_browser
+    browser_driver: str = "nodriver"  # personal 模式的浏览器驱动: nodriver 或 drission
     yescaptcha_api_key: str = ""
     yescaptcha_base_url: str = "https://api.yescaptcha.com"
     capmonster_api_key: str = ""

@@ -1936,15 +1936,25 @@ class FlowClient:
         """
         captcha_method = config.captcha_method
 
-        # 内置浏览器打码 (nodriver)
+        # 内置浏览器打码 (nodriver 或 DrissionPage)
         if captcha_method == "personal":
             try:
-                from .browser_captcha_personal import BrowserCaptchaService
-                service = await BrowserCaptchaService.get_instance(self.db)
-                token = await service.get_token(project_id, action)
-                fingerprint = service.get_last_fingerprint() if token else None
-                self._set_request_fingerprint(fingerprint if token else None)
-                return token, None
+                # 检查使用哪个浏览器驱动
+                browser_driver = getattr(config, 'browser_driver_attr', 'nodriver')
+
+                if browser_driver == "drission":
+                    from .browser_captcha_drission import DrissionCaptchaService
+                    service = await DrissionCaptchaService.get_instance(self.db)
+                    token = await service.get_token(project_id, action)
+                    self._set_request_fingerprint(None)
+                    return token, None
+                else:
+                    from .browser_captcha_personal import BrowserCaptchaService
+                    service = await BrowserCaptchaService.get_instance(self.db)
+                    token = await service.get_token(project_id, action)
+                    fingerprint = service.get_last_fingerprint() if token else None
+                    self._set_request_fingerprint(fingerprint if token else None)
+                    return token, None
             except RuntimeError as e:
                 # 捕获 Docker 环境或依赖缺失的明确错误
                 error_msg = str(e)
@@ -1954,7 +1964,7 @@ class FlowClient:
                 return None, None
             except ImportError as e:
                 debug_logger.log_error(f"[reCAPTCHA Personal] 导入失败: {str(e)}")
-                print(f"[reCAPTCHA] ❌ nodriver 未安装，请运行: pip install nodriver")
+                print(f"[reCAPTCHA] ❌ 浏览器驱动未安装")
                 self._set_request_fingerprint(None)
                 return None, None
             except Exception as e:

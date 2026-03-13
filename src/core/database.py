@@ -259,6 +259,7 @@ class Database:
                     CREATE TABLE captcha_config (
                         id INTEGER PRIMARY KEY DEFAULT 1,
                         captcha_method TEXT DEFAULT 'browser',
+                        browser_driver TEXT DEFAULT 'nodriver',
                         yescaptcha_api_key TEXT DEFAULT '',
                         yescaptcha_base_url TEXT DEFAULT 'https://api.yescaptcha.com',
                         capmonster_api_key TEXT DEFAULT '',
@@ -274,6 +275,7 @@ class Database:
                         page_action TEXT DEFAULT 'IMAGE_GENERATION',
                         browser_proxy_enabled BOOLEAN DEFAULT 0,
                         browser_proxy_url TEXT,
+                        browser_count INTEGER DEFAULT 1,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
@@ -574,6 +576,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS captcha_config (
                     id INTEGER PRIMARY KEY DEFAULT 1,
                     captcha_method TEXT DEFAULT 'browser',
+                    browser_driver TEXT DEFAULT 'nodriver',
                     yescaptcha_api_key TEXT DEFAULT '',
                     yescaptcha_base_url TEXT DEFAULT 'https://api.yescaptcha.com',
                     capmonster_api_key TEXT DEFAULT '',
@@ -1520,6 +1523,7 @@ class Database:
     async def update_captcha_config(
         self,
         captcha_method: str = None,
+        browser_driver: str = None,
         yescaptcha_api_key: str = None,
         yescaptcha_base_url: str = None,
         capmonster_api_key: str = None,
@@ -1544,6 +1548,7 @@ class Database:
             if row:
                 current = dict(row)
                 new_method = captcha_method if captcha_method is not None else current.get("captcha_method", "yescaptcha")
+                new_driver = browser_driver if browser_driver is not None else current.get("browser_driver", "nodriver")
                 new_yes_key = yescaptcha_api_key if yescaptcha_api_key is not None else current.get("yescaptcha_api_key", "")
                 new_yes_url = yescaptcha_base_url if yescaptcha_base_url is not None else current.get("yescaptcha_base_url", "https://api.yescaptcha.com")
                 new_cap_key = capmonster_api_key if capmonster_api_key is not None else current.get("capmonster_api_key", "")
@@ -1562,19 +1567,20 @@ class Database:
 
                 await db.execute("""
                     UPDATE captcha_config
-                    SET captcha_method = ?, yescaptcha_api_key = ?, yescaptcha_base_url = ?,
+                    SET captcha_method = ?, browser_driver = ?, yescaptcha_api_key = ?, yescaptcha_base_url = ?,
                         capmonster_api_key = ?, capmonster_base_url = ?,
                         ezcaptcha_api_key = ?, ezcaptcha_base_url = ?,
                         capsolver_api_key = ?, capsolver_base_url = ?,
                         remote_browser_base_url = ?, remote_browser_api_key = ?, remote_browser_timeout = ?,
                         browser_proxy_enabled = ?, browser_proxy_url = ?, browser_count = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = 1
-                """, (new_method, new_yes_key, new_yes_url, new_cap_key, new_cap_url,
+                """, (new_method, new_driver, new_yes_key, new_yes_url, new_cap_key, new_cap_url,
                       new_ez_key, new_ez_url, new_cs_key, new_cs_url,
                       (new_remote_base_url or "").strip(), (new_remote_api_key or "").strip(), new_remote_timeout,
                       new_proxy_enabled, new_proxy_url, new_browser_count))
             else:
                 new_method = captcha_method if captcha_method is not None else "yescaptcha"
+                new_driver = browser_driver if browser_driver is not None else "nodriver"
                 new_yes_key = yescaptcha_api_key if yescaptcha_api_key is not None else ""
                 new_yes_url = yescaptcha_base_url if yescaptcha_base_url is not None else "https://api.yescaptcha.com"
                 new_cap_key = capmonster_api_key if capmonster_api_key is not None else ""
@@ -1592,13 +1598,13 @@ class Database:
                 new_remote_timeout = max(5, int(new_remote_timeout))
 
                 await db.execute("""
-                    INSERT INTO captcha_config (id, captcha_method, yescaptcha_api_key, yescaptcha_base_url,
+                    INSERT INTO captcha_config (id, captcha_method, browser_driver, yescaptcha_api_key, yescaptcha_base_url,
                         capmonster_api_key, capmonster_base_url, ezcaptcha_api_key, ezcaptcha_base_url,
                         capsolver_api_key, capsolver_base_url,
                         remote_browser_base_url, remote_browser_api_key, remote_browser_timeout,
                         browser_proxy_enabled, browser_proxy_url, browser_count)
-                    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (new_method, new_yes_key, new_yes_url, new_cap_key, new_cap_url,
+                    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (new_method, new_driver, new_yes_key, new_yes_url, new_cap_key, new_cap_url,
                       new_ez_key, new_ez_url, new_cs_key, new_cs_url,
                       (new_remote_base_url or "").strip(), (new_remote_api_key or "").strip(), new_remote_timeout,
                       new_proxy_enabled, new_proxy_url, new_browser_count))

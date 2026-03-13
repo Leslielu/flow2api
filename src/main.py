@@ -68,8 +68,12 @@ async def lifespan(app: FastAPI):
 
     # Load captcha configuration from database
     captcha_config = await db.get_captcha_config()
-    
+
     config.set_captcha_method(captcha_config.captcha_method)
+
+    # 设置 browser_driver 配置 (nodriver 或 drission)
+    browser_driver = getattr(captcha_config, 'browser_driver', 'nodriver')
+    config.set_browser_driver(browser_driver)
     config.set_yescaptcha_api_key(captcha_config.yescaptcha_api_key)
     config.set_yescaptcha_base_url(captcha_config.yescaptcha_base_url)
     config.set_capmonster_api_key(captcha_config.capmonster_api_key)
@@ -85,10 +89,18 @@ async def lifespan(app: FastAPI):
     # Initialize browser captcha service if needed
     browser_service = None
     if captcha_config.captcha_method == "personal":
-        from .services.browser_captcha_personal import BrowserCaptchaService
-        browser_service = await BrowserCaptchaService.get_instance(db)
-        print("✓ Browser captcha service initialized (nodriver mode)")
-        
+        # 获取 browser_driver 配置（nodriver 或 drission）
+        browser_driver = getattr(captcha_config, 'browser_driver', 'nodriver')
+
+        if browser_driver == "drission":
+            from .services.browser_captcha_drission import DrissionCaptchaService
+            browser_service = await DrissionCaptchaService.get_instance(db)
+            print("✓ Browser captcha service initialized (DrissionPage mode)")
+        else:
+            from .services.browser_captcha_personal import BrowserCaptchaService
+            browser_service = await BrowserCaptchaService.get_instance(db)
+            print("✓ Browser captcha service initialized (nodriver mode)")
+
         # 启动常驻模式：从第一个可用token获取project_id
         tokens = await token_manager.get_all_tokens()
         resident_project_id = None
@@ -96,7 +108,7 @@ async def lifespan(app: FastAPI):
             if t.current_project_id and t.is_active:
                 resident_project_id = t.current_project_id
                 break
-        
+
         if resident_project_id:
             # 直接启动常驻模式（会自动导航到项目页面，cookie已持久化）
             await browser_service.start_resident_mode(resident_project_id)

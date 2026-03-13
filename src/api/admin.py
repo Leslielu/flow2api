@@ -1318,6 +1318,7 @@ async def update_captcha_config(
     from ..services.browser_captcha import validate_browser_proxy_url
 
     captcha_method = request.get("captcha_method")
+    browser_driver = request.get("browser_driver", "nodriver")
     yescaptcha_api_key = request.get("yescaptcha_api_key")
     yescaptcha_base_url = request.get("yescaptcha_base_url")
     capmonster_api_key = request.get("capmonster_api_key")
@@ -1358,6 +1359,7 @@ async def update_captcha_config(
 
     await db.update_captcha_config(
         captcha_method=captcha_method,
+        browser_driver=browser_driver,
         yescaptcha_api_key=yescaptcha_api_key,
         yescaptcha_base_url=yescaptcha_base_url,
         capmonster_api_key=capmonster_api_key,
@@ -1395,6 +1397,7 @@ async def get_captcha_config(token: str = Depends(verify_admin_token)):
     captcha_config = await db.get_captcha_config()
     return {
         "captcha_method": captcha_config.captcha_method,
+        "browser_driver": getattr(captcha_config, 'browser_driver', 'nodriver'),
         "yescaptcha_api_key": captcha_config.yescaptcha_api_key,
         "yescaptcha_base_url": captcha_config.yescaptcha_base_url,
         "capmonster_api_key": captcha_config.capmonster_api_key,

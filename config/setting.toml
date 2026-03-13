@@ -1,7 +1,7 @@
 [global]
-api_key = "han1234"
+api_key = "daohelulu1234"
 admin_username = "admin"
-admin_password = "admin"
+admin_password = "adminadmin$$"
 
 [flow]
 labs_base_url = "https://labs.google/fx/api"
@@ -29,7 +29,7 @@ host = "0.0.0.0"
 port = 8000
 
 [debug]
-enabled = false
+enabled = true
 log_requests = true
 log_responses = true
 mask_token = true
@@ -46,15 +46,16 @@ video_timeout = 1500
 error_ban_threshold = 3
 
 [cache]
-enabled = false
+enabled = true
 timeout = 7200  # 缓存超时时间(秒), 默认2小时
 base_url = ""   # 缓存文件访问的基础URL, 留空则使用服务器地址
 
 [captcha]
-captcha_method = "browser"  # 打码方式: yescaptcha/browser/personal/remote_browser
+captcha_method = "personal"  # 打码方式: yescaptcha/browser/personal/remote_browser
+browser_driver = "drission"  # personal 模式下使用的浏览器驱动: drission 或 nodriver
 browser_recaptcha_settle_seconds = 1.0  # 打码完成额外稳态等待，速度优先可设 1.0
 browser_launch_background = true  # browser 打码默认后台启动(最小化/避免抢占前台)
-yescaptcha_api_key = ""  # YesCaptcha API密钥
+yescaptcha_api_key = "ff30bfa499df0853abdd5268cf5aef028a9a9da485170"  # YesCaptcha API密钥
 yescaptcha_base_url = "https://api.yescaptcha.com"
 remote_browser_base_url = ""  # 远程有头打码服务地址
 remote_browser_api_key = ""   # 远程有头打码服务 API Key
