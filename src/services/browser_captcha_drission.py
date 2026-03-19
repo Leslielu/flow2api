@@ -570,15 +570,50 @@ class DrissionCaptchaService:
                         continue
 
                     # 检查 session token 是否变化
-                    if token.st != new_session_token:
+                    st_changed = token.st != new_session_token
+                    if st_changed:
                         debug_logger.log_info(f"[DrissionCaptcha] Token {token.id} ({token.email}) 的 Session Token 已更新")
                         await self._update_token_st(token.id, new_session_token)
+
+                    # 如果 token 被禁用（非429原因），尝试自动恢复
+                    if not token.is_active and token.ban_reason != "429_rate_limit":
+                        st_for_recovery = new_session_token if st_changed else token.st
+                        await self._try_recover_disabled_token(token.id, token.email, st_for_recovery)
 
                 except Exception as e:
                     debug_logger.log_error(f"[DrissionCaptcha] 检查 project_id={project_id} 的 Session Token 失败: {e}")
 
         except Exception as e:
             debug_logger.log_error(f"[DrissionCaptcha] 检查 Session Token 异常: {e}")
+
+    async def _try_recover_disabled_token(self, token_id: int, email: str, st: str):
+        """尝试恢复被禁用的 Token：用当前 ST 刷新 AT，成功则重新启用
+
+        仅在心跳检查 Session Token 时调用，用于自动恢复因 AT/ST 刷新失败被禁用的 token。
+        不会恢复因 429 被禁用的 token（那些由 auto_unban_429_tokens 处理）。
+
+        Args:
+            token_id: Token ID
+            email: Token 邮箱（用于日志）
+            st: 用于刷新 AT 的 Session Token
+        """
+        try:
+            debug_logger.log_info(f"[AUTO_RECOVER] Token {token_id} ({email}): 尝试自动恢复...")
+
+            from .token_manager import TokenManager
+            tm = TokenManager(self.db)
+
+            # 用 ST 尝试刷新 AT
+            result = await tm._do_refresh_at(token_id, st)
+            if result:
+                await tm.enable_token(token_id)
+                debug_logger.log_info(f"[AUTO_RECOVER] ✅ Token {token_id} ({email}) 自动恢复成功")
+                await self._send_telegram_alert(f"✅ flow2api: Token {token_id} ({email}) 已自动恢复")
+            else:
+                debug_logger.log_warning(f"[AUTO_RECOVER] Token {token_id} ({email}): AT 刷新失败，保持禁用")
+
+        except Exception as e:
+            debug_logger.log_error(f"[AUTO_RECOVER] Token {token_id} ({email}): 自动恢复异常 - {e}")
 
     async def _get_token_by_project_id(self, project_id: str):
         """根据 project_id 查询对应的 Token
