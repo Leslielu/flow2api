@@ -477,6 +477,9 @@ class DrissionCaptchaService:
                 # 5) 心跳后检查并更新 Session Token
                 await self._check_and_update_session_tokens()
 
+                # 6) 心跳后检查并刷新 Access Token（AT）
+                await self._check_and_refresh_access_tokens()
+
             except asyncio.CancelledError:
                 debug_logger.log_info("[DrissionCaptcha] 心跳任务被取消")
                 break
@@ -614,6 +617,40 @@ class DrissionCaptchaService:
 
         except Exception as e:
             debug_logger.log_error(f"[AUTO_RECOVER] Token {token_id} ({email}): 自动恢复异常 - {e}")
+
+    async def _check_and_refresh_access_tokens(self):
+        """检查并刷新即将过期的 AT（心跳时调用）
+
+        遍历所有活跃 token，发现 AT 过期或即将过期时主动刷新，
+        刷新成功后重载该 token 对应的常驻标签页，使新 session 生效。
+        """
+        if not self.db:
+            return
+        try:
+            from .token_manager import TokenManager
+            tm = TokenManager(self.db)
+            tokens = await self.db.get_active_tokens()
+            for token in tokens:
+                if not tm._should_refresh_at(token):
+                    continue
+                debug_logger.log_info(f"[DrissionCaptcha] [AT_CHECK] Token {token.id} AT 即将过期/已过期，心跳触发刷新...")
+                refreshed = await tm._refresh_at(token.id)
+                if refreshed:
+                    debug_logger.log_info(f"[DrissionCaptcha] [AT_CHECK] Token {token.id} AT 刷新成功，重载对应常驻页...")
+                    # 找出该 token 关联的所有常驻标签页并重载
+                    for project_id, resident_info in list(self._resident_tabs.items()):
+                        tab_token = await self._get_token_by_project_id(project_id)
+                        if tab_token and tab_token.id == token.id and resident_info and resident_info.tab:
+                            try:
+                                debug_logger.log_info(f"[DrissionCaptcha] [AT_CHECK] 重载常驻页 project={project_id}")
+                                await _run_in_thread(self._sync_reload_tab, resident_info.tab)
+                                await self._wait_page_load(resident_info.tab, timeout=30)
+                            except Exception as e:
+                                debug_logger.log_warning(f"[DrissionCaptcha] [AT_CHECK] 重载常驻页失败 project={project_id}: {e}")
+                else:
+                    debug_logger.log_warning(f"[DrissionCaptcha] [AT_CHECK] Token {token.id} AT 刷新失败")
+        except Exception as e:
+            debug_logger.log_error(f"[DrissionCaptcha] AT 心跳检查异常: {e}")
 
     async def _get_token_by_project_id(self, project_id: str):
         """根据 project_id 查询对应的 Token
