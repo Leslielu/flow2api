@@ -277,6 +277,34 @@ class Config:
         self._config["generation"]["video_timeout"] = timeout
 
     @property
+    def polling_mode_enabled(self) -> bool:
+        """Get polling mode enabled status."""
+        return self.call_logic_mode == "polling"
+
+    @property
+    def call_logic_mode(self) -> str:
+        """Get call logic mode (default or polling)."""
+        call_logic = self._config.get("call_logic", {})
+        mode = call_logic.get("call_mode")
+        if mode in ("default", "polling"):
+            return mode
+        if call_logic.get("polling_mode_enabled", False):
+            return "polling"
+        return "default"
+
+    def set_polling_mode_enabled(self, enabled: bool):
+        """Set polling mode enabled/disabled."""
+        self.set_call_logic_mode("polling" if enabled else "default")
+
+    def set_call_logic_mode(self, mode: str):
+        """Set call logic mode (default or polling)."""
+        normalized = "polling" if mode == "polling" else "default"
+        if "call_logic" not in self._config:
+            self._config["call_logic"] = {}
+        self._config["call_logic"]["call_mode"] = normalized
+        self._config["call_logic"]["polling_mode_enabled"] = normalized == "polling"
+
+    @property
     def upsample_timeout(self) -> int:
         """Get upsample (4K/2K) timeout in seconds"""
         return self._config.get("generation", {}).get("upsample_timeout", 300)
@@ -371,6 +399,51 @@ class Config:
             return max(60, int(value))
         except Exception:
             return 600
+
+    @property
+    def personal_max_resident_tabs(self) -> int:
+        """内置浏览器打码的共享标签页上限"""
+        value = self._config.get("captcha", {}).get("personal_max_resident_tabs", 5)
+        try:
+            return max(1, min(50, int(value)))  # 限制在1-50之间
+        except Exception:
+            return 5
+
+    @property
+    def personal_project_pool_size(self) -> int:
+        """单个 Token 默认维护的项目池数量，仅影响项目轮换。"""
+        value = self._config.get("captcha", {}).get("personal_project_pool_size", 4)
+        try:
+            return max(1, min(50, int(value)))
+        except Exception:
+            return 4
+
+    @property
+    def personal_idle_tab_ttl_seconds(self) -> int:
+        """内置浏览器打码标签页空闲超时(秒)"""
+        value = self._config.get("captcha", {}).get("personal_idle_tab_ttl_seconds", 600)
+        try:
+            return max(60, int(value))
+        except Exception:
+            return 600
+
+    def set_personal_max_resident_tabs(self, value: int):
+        """设置内置浏览器打码的共享标签页上限"""
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["personal_max_resident_tabs"] = max(1, min(50, int(value)))
+
+    def set_personal_project_pool_size(self, value: int):
+        """设置单个 Token 默认维护的项目池数量，仅影响项目轮换"""
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["personal_project_pool_size"] = max(1, min(50, int(value)))
+
+    def set_personal_idle_tab_ttl_seconds(self, value: int):
+        """设置内置浏览器打码标签页空闲超时(秒)"""
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["personal_idle_tab_ttl_seconds"] = max(60, int(value))
 
     @property
     def yescaptcha_api_key(self) -> str:

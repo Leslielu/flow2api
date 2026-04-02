@@ -9,6 +9,7 @@
         @keyframes slide-up{from{transform:translateY(100%);opacity:0}to{transform:translateY(0);opacity:1}}
         .animate-slide-up{animation:slide-up .3s ease-out}
         .tab-btn{transition:all .2s ease}
+        .line-clamp-2{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
     </style>
     <script>
         tailwind.config={theme:{extend:{colors:{border:"hsl(0 0% 89%)",input:"hsl(0 0% 89%)",ring:"hsl(0 0% 3.9%)",background:"hsl(0 0% 100%)",foreground:"hsl(0 0% 3.9%)",primary:{DEFAULT:"hsl(0 0% 9%)",foreground:"hsl(0 0% 98%)"},secondary:{DEFAULT:"hsl(0 0% 96.1%)",foreground:"hsl(0 0% 9%)"},muted:{DEFAULT:"hsl(0 0% 96.1%)",foreground:"hsl(0 0% 45.1%)"},destructive:{DEFAULT:"hsl(0 84.2% 60.2%)",foreground:"hsl(0 0% 98%)"}}}}}
@@ -46,6 +47,7 @@
                 <button onclick="switchTab('tokens')" id="tabTokens" class="tab-btn border-b-2 border-primary text-sm font-medium py-3 px-1">Token 管理</button>
                 <button onclick="switchTab('settings')" id="tabSettings" class="tab-btn border-b-2 border-transparent text-sm font-medium py-3 px-1">系统配置</button>
                 <button onclick="switchTab('logs')" id="tabLogs" class="tab-btn border-b-2 border-transparent text-sm font-medium py-3 px-1">请求日志</button>
+                <a href="/test" id="tabTestPage" class="tab-btn inline-flex items-center border-b-2 border-transparent text-sm font-medium py-3 px-1">测试页面</a>
             </nav>
         </div>
 
@@ -245,6 +247,21 @@
                     <button onclick="saveGenerationTimeout()" class="inline-flex items-center justify-center rounded-md bg-primary text-primary-foreground hover:bg-primary/90 h-9 px-4 w-full mt-4">保存配置</button>
                 </div>
 
+                <div class="rounded-lg border border-border bg-background p-6 flex flex-col">
+                    <h3 class="text-lg font-semibold mb-4">Token 轮询配置</h3>
+                    <div class="space-y-4 flex-1">
+                        <div>
+                            <label class="text-sm font-medium mb-2 block">轮询模式</label>
+                            <select id="cfgCallLogicMode" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm">
+                                <option value="default">随机轮询</option>
+                                <option value="polling">顺序轮询</option>
+                            </select>
+                            <p class="text-xs text-muted-foreground mt-1">随机轮询使用默认负载优先策略；顺序轮询会按可用Token的稳定顺序依次使用，全部轮完后再开始下一轮。</p>
+                        </div>
+                    </div>
+                    <button onclick="saveCallLogicConfig()" class="inline-flex items-center justify-center rounded-md bg-primary text-primary-foreground hover:bg-primary/90 h-9 px-4 w-full mt-4">保存配置</button>
+                </div>
+
                 <!-- 错误处理配置 -->
                 <div class="rounded-lg border border-border bg-background p-6 flex flex-col">
                     <h3 class="text-lg font-semibold mb-4">错误处理配置</h3>
@@ -423,8 +440,8 @@
                                 <label class="text-sm font-medium mb-2 block">代理地址</label>
                                 <input id="cfgBrowserProxyUrl" type="text" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="http://host:port 或 socks5://host:port">
                                 <p class="text-xs text-muted-foreground mt-1">
-                                    ⚠️ <strong>仅支持：</strong>HTTP代理（可带认证）或 SOCKS5代理（不可带认证）<br>
-                                    示例：<code class="bg-muted px-1 py-0.5 rounded">http://user:pass@proxy.com:8080</code> 或 <code class="bg-muted px-1 py-0.5 rounded">socks5://proxy.com:1080</code>
+                                    ✅ <strong>支持：</strong>HTTP/HTTPS/SOCKS5/SOCKS5H 代理，均支持带认证<br>
+                                    示例：<code class="bg-muted px-1 py-0.5 rounded">http://user:pass@proxy.com:8080</code> 或 <code class="bg-muted px-1 py-0.5 rounded">socks5://user:pass@proxy.com:1080</code>
                                 </p>
                             </div>
 
@@ -432,6 +449,58 @@
                                 <label class="text-sm font-medium mb-2 block">浏览器数量</label>
                                 <input id="cfgBrowserCount" type="number" min="1" max="20" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="1" value="1">
                                 <p class="text-xs text-muted-foreground mt-1">同时启动的浏览器实例数量，每个浏览器只开1个标签页，请求轮询分配</p>
+                            </div>
+                        </div>
+
+                        <!-- 内置浏览器打码配置选项 -->
+                        <div id="personalOptions" class="hidden space-y-4">
+                            <div class="rounded-md bg-blue-50 dark:bg-blue-900/20 p-3 border border-blue-200 dark:border-blue-800">
+                                <p class="text-xs text-blue-800 dark:text-blue-200">
+                                    ℹ️ <strong>内置浏览器打码：</strong>使用nodriver自动化浏览器获取验证码，支持标签页复用，性能更优
+                                </p>
+                            </div>
+
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class="text-sm font-medium mb-2 block">单 Token 项目池大小</label>
+                                    <input id="cfgPersonalProjectPoolSize" type="number" min="1" max="50" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="4" value="4">
+                                    <p class="text-xs text-muted-foreground mt-1">
+                                        只影响该 Token 可轮换的 project_id 数量，不决定打码标签页数。<br>
+                                        打码标签页由全局共享池统一复用。
+                                    </p>
+                                </div>
+
+                                <div>
+                                    <label class="text-sm font-medium mb-2 block">最大标签页数量</label>
+                                    <input id="cfgPersonalMaxTabs" type="number" min="1" max="50" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="5" value="5">
+                                    <p class="text-xs text-muted-foreground mt-1">
+                                        决定 personal 模式最多保留多少个共享打码标签页。<br>
+                                        并发打码能力主要看这里，不够就优先调大这个值。
+                                    </p>
+                                </div>
+                            </div>
+
+                            <div>
+                                <label class="text-sm font-medium mb-2 block">标签空闲超时(秒)</label>
+                                <input id="cfgPersonalIdleTTL" type="number" min="60" max="3600" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="600" value="600">
+                                <p class="text-xs text-muted-foreground mt-1">标签页空闲多久后自动回收，默认600秒(10分钟)</p>
+                            </div>
+
+                            <div class="pt-3 border-t border-border">
+                                <label class="inline-flex items-center gap-2 cursor-pointer">
+                                    <input type="checkbox" id="cfgPersonalProxyEnabled" class="h-4 w-4 rounded border-input" onchange="togglePersonalProxyInput()">
+                                    <span class="text-sm font-medium">启用代理</span>
+                                </label>
+                                <p class="text-xs text-muted-foreground mt-2">为内置浏览器配置独立代理（优先级高于全局请求代理）</p>
+                            </div>
+
+                            <div id="personalProxyUrlInput" class="hidden">
+                                <label class="text-sm font-medium mb-2 block">代理地址</label>
+                                <input id="cfgPersonalProxyUrl" type="text" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="http://host:port 或 socks5://host:port">
+                                <p class="text-xs text-muted-foreground mt-1">
+                                    ✅ <strong>支持：</strong>HTTP/HTTPS/SOCKS5/SOCKS5H 代理，均支持带认证<br>
+                                    示例：<code class="bg-muted px-1 py-0.5 rounded">http://user:pass@proxy.com:8080</code> 或 <code class="bg-muted px-1 py-0.5 rounded">socks5://user:pass@proxy.com:1080</code>
+                                </p>
                             </div>
                         </div>
 
@@ -457,11 +526,9 @@
                             </div>
                         </div>
                     </div>
-                    <div class="grid grid-cols-2 gap-2 mt-4">
-                        <button id="btnTestCaptchaScore" onclick="testCaptchaScore()" class="inline-flex items-center justify-center rounded-md border border-input bg-background hover:bg-accent h-9 px-4">测试当前打码分数</button>
+                    <div class="mt-4">
                         <button onclick="saveCaptchaConfig()" class="inline-flex items-center justify-center rounded-md bg-primary text-primary-foreground hover:bg-primary/90 h-9 px-4">保存配置</button>
                     </div>
-                    <p id="captchaScoreTestResult" class="text-xs text-muted-foreground mt-2">测试目标：<code class="bg-muted px-1 py-0.5 rounded">https://antcpt.com/score_detector/</code></p>
                 </div>
 
                 <!-- 调试配置 -->
@@ -514,6 +581,7 @@
                                 <th class="h-10 px-3 text-left align-middle font-medium text-muted-foreground">&#29366;&#24577;</th>
                                 <th class="h-10 px-3 text-left align-middle font-medium text-muted-foreground">&#36827;&#24230;</th>
                                 <th class="h-10 px-3 text-left align-middle font-medium text-muted-foreground">&#29366;&#24577;&#30721;</th>
+                                <th class="h-10 w-[17rem] px-3 text-left align-middle font-medium text-muted-foreground">结果摘要</th>
                                 <th class="h-10 px-3 text-left align-middle font-medium text-muted-foreground">&#32791;&#26102;(&#31186;)</th>
                                 <th class="h-10 px-3 text-left align-middle font-medium text-muted-foreground">&#26102;&#38388;</th>
                                 <th class="h-10 px-3 text-left align-middle font-medium text-muted-foreground">&#35814;&#24773;</th>
@@ -768,7 +836,7 @@
         formatSora2=(t)=>{if(t.sora2_supported===true){const remaining=t.sora2_total_count-t.sora2_redeemed_count;const tooltipText=`邀请码: ${t.sora2_invite_code||'无'}\n可用次数: ${remaining}/${t.sora2_total_count}\n已用次数: ${t.sora2_redeemed_count}`;return`<div class="inline-flex items-center gap-1"><span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-green-50 text-green-700 cursor-pointer" title="${tooltipText}" onclick="copySora2Code('${t.sora2_invite_code||''}')">支持</span><span class="text-xs text-muted-foreground" title="${tooltipText}">${remaining}/${t.sora2_total_count}</span></div>`}else if(t.sora2_supported===false){return`<span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-gray-100 text-gray-700 cursor-pointer" title="点击使用邀请码激活" onclick="openSora2Modal(${t.id})">不支持</span>`}else{return'-'}},
         formatPlanTypeWithTooltip=(t)=>{const tooltipText=t.subscription_end?`套餐到期: ${new Date(t.subscription_end).toLocaleDateString('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit'}).replace(/\//g,'-')} ${new Date(t.subscription_end).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',hour12:false})}`:'';return`<span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-blue-50 text-blue-700 cursor-pointer" title="${tooltipText||t.plan_title||'-'}">${formatPlanType(t.plan_type)}</span>`},
         formatSora2Remaining=(t)=>{if(t.sora2_supported===true){const remaining=t.sora2_remaining_count||0;return`<span class="text-xs">${remaining}</span>`}else{return'-'}},
-        formatAccountType=(tier)=>{if(tier==='PAYGATE_TIER_NOT_PAID'||!tier){return`<span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-gray-100 text-gray-700">普通</span>`}if(tier==='PAYGATE_TIER_ONE'){return`<span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-blue-50 text-blue-700">Pro</span>`}if(tier==='PAYGATE_TIER_TWO'){return`<span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-purple-50 text-purple-700">Ult</span>`}return`<span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-amber-50 text-amber-700" title="${tier}">${tier}</span>`},
+        formatAccountType=(tier)=>{if(tier==='PAYGATE_TIER_NOT_PAID'||!tier){return`<span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-gray-100 text-gray-700">Free</span>`}if(tier==='PAYGATE_TIER_ONE'){return`<span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-blue-50 text-blue-700">Pro</span>`}if(tier==='PAYGATE_TIER_TWO'){return`<span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-purple-50 text-purple-700">Ult</span>`}return`<span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-amber-50 text-amber-700" title="${tier}">${tier}</span>`},
         formatProjectNameDisplay=name=>{if(!name)return'<span class="text-muted-foreground">-</span>';const text=String(name);const match=text.match(/^(.*?)(?:\s+(P\d+))$/);if(match){return`<div class="flex flex-col items-center justify-center gap-1 leading-none"><span class="text-xs font-medium text-foreground whitespace-nowrap">${escapeLogHtml(match[1])}</span><span class="inline-flex items-center rounded-full border border-slate-200 bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-700">${escapeLogHtml(match[2])}</span></div>`}return`<div class="text-center text-xs font-medium text-foreground whitespace-nowrap">${escapeLogHtml(text)}</div>`},
         formatProjectIdDisplay=projectId=>{if(!projectId)return'<span class="text-muted-foreground">-</span>';const text=String(projectId);const short=text.length>8?`${text.substring(0,8)}...`:text;return`<button onclick="copyProjectId('${projectId}')" class="inline-flex items-center justify-center rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[10px] font-mono font-medium text-blue-700 transition-colors hover:bg-blue-100 hover:text-blue-800" title="点击复制项目ID&#10;${escapeLogHtml(text)}">${escapeLogHtml(short)}</button>`},
         renderTokenActions=t=>{const toggleLabel=t.is_active?'禁用':'启用';return`<div class="inline-flex flex-nowrap items-center justify-end gap-1"><button onclick="refreshTokenAT(${t.id})" class="inline-flex h-7 items-center justify-center rounded-md px-2 text-xs font-medium hover:bg-blue-50 hover:text-blue-700">刷新AT</button><button onclick="openEditModal(${t.id})" class="inline-flex h-7 items-center justify-center rounded-md px-2 text-xs font-medium hover:bg-green-50 hover:text-green-700">详情</button><button onclick="toggleToken(${t.id},${t.is_active})" class="inline-flex h-7 items-center justify-center rounded-md px-2 text-xs font-medium hover:bg-accent">${toggleLabel}</button><button onclick="deleteToken(${t.id})" class="inline-flex h-7 items-center justify-center rounded-md px-2 text-xs font-medium hover:bg-destructive/10 hover:text-destructive">删除</button></div>`},
@@ -810,14 +878,15 @@
         toggleCacheOptions=()=>{const enabled=$('cfgCacheEnabled').checked;$('cacheOptions').style.display=enabled?'block':'none'},
         loadCacheConfig=async()=>{try{console.log('开始加载缓存配置...');const r=await apiRequest('/api/cache/config');if(!r){console.error('API请求失败');return}const d=await r.json();console.log('缓存配置数据:',d);if(d.success&&d.config){const enabled=d.config.enabled!==false;const timeout=d.config.timeout??7200;const baseUrl=d.config.base_url||'';const effectiveUrl=d.config.effective_base_url||'';console.log('设置缓存启用:',enabled);console.log('设置超时时间:',timeout);console.log('设置域名:',baseUrl);console.log('生效URL:',effectiveUrl);$('cfgCacheEnabled').checked=enabled;$('cfgCacheTimeout').value=timeout;$('cfgCacheBaseUrl').value=baseUrl;if(effectiveUrl){$('cacheEffectiveUrlValue').textContent=effectiveUrl;$('cacheEffectiveUrl').classList.remove('hidden')}else{$('cacheEffectiveUrl').classList.add('hidden')}toggleCacheOptions();console.log('缓存配置加载成功')}else{console.error('缓存配置数据格式错误:',d)}}catch(e){console.error('加载缓存配置失败:',e);showToast('加载缓存配置失败: '+e.message,'error')}},
         loadGenerationTimeout=async()=>{try{console.log('开始加载生成超时配置...');const r=await apiRequest('/api/generation/timeout');if(!r){console.error('API请求失败');return}const d=await r.json();console.log('生成超时配置数据:',d);if(d.success&&d.config){const imageTimeout=d.config.image_timeout||300;const videoTimeout=d.config.video_timeout||1500;console.log('设置图片超时:',imageTimeout);console.log('设置视频超时:',videoTimeout);$('cfgImageTimeout').value=imageTimeout;$('cfgVideoTimeout').value=videoTimeout;console.log('生成超时配置加载成功')}else{console.error('生成超时配置数据格式错误:',d)}}catch(e){console.error('加载生成超时配置失败:',e);showToast('加载生成超时配置失败: '+e.message,'error')}},
+        loadCallLogicConfig=async()=>{try{const r=await apiRequest('/api/call-logic/config');if(!r)return;const d=await r.json();if(d.success&&d.config){const mode=d.config.call_mode||((d.config.polling_mode_enabled||false)?'polling':'default');$('cfgCallLogicMode').value=mode}else{console.error('轮询模式配置数据格式错误:',d)}}catch(e){console.error('加载轮询模式配置失败:',e);showToast('加载轮询模式配置失败: '+e.message,'error')}},
         saveCacheConfig=async()=>{const enabled=$('cfgCacheEnabled').checked,timeoutInput=$('cfgCacheTimeout').value.trim(),timeout=timeoutInput===''?7200:parseInt(timeoutInput,10),baseUrl=$('cfgCacheBaseUrl').value.trim();console.log('保存缓存配置:',{enabled,timeout,baseUrl});if(Number.isNaN(timeout)||timeout<0||timeout>86400)return showToast('缓存超时时间必须在 0-86400 秒之间，0 表示不删除','error');if(baseUrl&&!baseUrl.startsWith('http://')&&!baseUrl.startsWith('https://'))return showToast('域名必须以 http:// 或 https:// 开头','error');try{console.log('保存缓存启用状态...');const r0=await apiRequest('/api/cache/enabled',{method:'POST',body:JSON.stringify({enabled:enabled})});if(!r0){console.error('保存缓存启用状态请求失败');return}const d0=await r0.json();console.log('缓存启用状态保存结果:',d0);if(!d0.success){console.error('保存缓存启用状态失败:',d0);return showToast('保存缓存启用状态失败','error')}console.log('保存超时时间...');const r1=await apiRequest('/api/cache/config',{method:'POST',body:JSON.stringify({timeout:timeout})});if(!r1){console.error('保存超时时间请求失败');return}const d1=await r1.json();console.log('超时时间保存结果:',d1);if(!d1.success){console.error('保存超时时间失败:',d1);return showToast('保存超时时间失败','error')}console.log('保存域名...');const r2=await apiRequest('/api/cache/base-url',{method:'POST',body:JSON.stringify({base_url:baseUrl})});if(!r2){console.error('保存域名请求失败');return}const d2=await r2.json();console.log('域名保存结果:',d2);if(d2.success){showToast('缓存配置保存成功','success');console.log('等待配置文件写入完成...');await new Promise(r=>setTimeout(r,200));console.log('重新加载配置...');await loadCacheConfig()}else{console.error('保存域名失败:',d2);showToast('保存域名失败','error')}}catch(e){console.error('保存失败:',e);showToast('保存失败: '+e.message,'error')}},
         saveGenerationTimeout=async()=>{const imageTimeout=parseInt($('cfgImageTimeout').value)||300,videoTimeout=parseInt($('cfgVideoTimeout').value)||1500;console.log('保存生成超时配置:',{imageTimeout,videoTimeout});if(imageTimeout<60||imageTimeout>3600)return showToast('图片超时时间必须在 60-3600 秒之间','error');if(videoTimeout<60||videoTimeout>7200)return showToast('视频超时时间必须在 60-7200 秒之间','error');try{const r=await apiRequest('/api/generation/timeout',{method:'POST',body:JSON.stringify({image_timeout:imageTimeout,video_timeout:videoTimeout})});if(!r){console.error('保存请求失败');return}const d=await r.json();console.log('保存结果:',d);if(d.success){showToast('生成超时配置保存成功','success');await new Promise(r=>setTimeout(r,200));await loadGenerationTimeout()}else{console.error('保存失败:',d);showToast('保存失败','error')}}catch(e){console.error('保存失败:',e);showToast('保存失败: '+e.message,'error')}},
-        toggleCaptchaOptions=()=>{const method=$('cfgCaptchaMethod').value;$('yescaptchaOptions').style.display=method==='yescaptcha'?'block':'none';$('capmonsterOptions').classList.toggle('hidden',method!=='capmonster');$('ezcaptchaOptions').classList.toggle('hidden',method!=='ezcaptcha');$('capsolverOptions').classList.toggle('hidden',method!=='capsolver');$('browserCaptchaOptions').classList.toggle('hidden',method!=='browser');$('remoteBrowserOptions').classList.toggle('hidden',method!=='remote_browser')},
+        saveCallLogicConfig=async()=>{const callMode=$('cfgCallLogicMode').value||'default';try{const r=await apiRequest('/api/call-logic/config',{method:'POST',body:JSON.stringify({call_mode:callMode})});if(!r)return;const d=await r.json();if(d.success){showToast('Token轮询配置保存成功','success');await loadCallLogicConfig()}else{showToast(d.message||'保存失败','error')}}catch(e){console.error('保存轮询模式配置失败:',e);showToast('保存轮询模式配置失败: '+e.message,'error')}},
+        toggleCaptchaOptions=()=>{const method=$('cfgCaptchaMethod').value;$('yescaptchaOptions').style.display=method==='yescaptcha'?'block':'none';$('capmonsterOptions').classList.toggle('hidden',method!=='capmonster');$('ezcaptchaOptions').classList.toggle('hidden',method!=='ezcaptcha');$('capsolverOptions').classList.toggle('hidden',method!=='capsolver');$('browserCaptchaOptions').classList.toggle('hidden',method!=='browser');$('personalOptions').classList.toggle('hidden',method!=='personal');$('remoteBrowserOptions').classList.toggle('hidden',method!=='remote_browser')},
         toggleBrowserProxyInput=()=>{const enabled=$('cfgBrowserProxyEnabled').checked;$('browserProxyUrlInput').classList.toggle('hidden',!enabled)},
-        loadCaptchaConfig=async()=>{try{console.log('开始加载验证码配置...');const r=await apiRequest('/api/captcha/config');if(!r){console.error('API请求失败');return}const d=await r.json();console.log('验证码配置数据:',d);$('cfgCaptchaMethod').value=d.captcha_method||'yescaptcha';$('cfgYescaptchaApiKey').value=d.yescaptcha_api_key||'';$('cfgYescaptchaBaseUrl').value=d.yescaptcha_base_url||'https://api.yescaptcha.com';$('cfgCapmonsterApiKey').value=d.capmonster_api_key||'';$('cfgCapmonsterBaseUrl').value=d.capmonster_base_url||'https://api.capmonster.cloud';$('cfgEzcaptchaApiKey').value=d.ezcaptcha_api_key||'';$('cfgEzcaptchaBaseUrl').value=d.ezcaptcha_base_url||'https://api.ez-captcha.com';$('cfgCapsolverApiKey').value=d.capsolver_api_key||'';$('cfgCapsolverBaseUrl').value=d.capsolver_base_url||'https://api.capsolver.com';$('cfgRemoteBrowserBaseUrl').value=d.remote_browser_base_url||'';$('cfgRemoteBrowserApiKey').value=d.remote_browser_api_key||'';$('cfgRemoteBrowserTimeout').value=d.remote_browser_timeout||60;$('cfgBrowserProxyEnabled').checked=d.browser_proxy_enabled||false;$('cfgBrowserProxyUrl').value=d.browser_proxy_url||'';$('cfgBrowserCount').value=d.browser_count||1;toggleCaptchaOptions();toggleBrowserProxyInput();console.log('验证码配置加载成功')}catch(e){console.error('加载验证码配置失败:',e);showToast('加载验证码配置失败: '+e.message,'error')}},
-        saveCaptchaConfig=async()=>{const method=$('cfgCaptchaMethod').value,yesApiKey=$('cfgYescaptchaApiKey').value.trim(),yesBaseUrl=$('cfgYescaptchaBaseUrl').value.trim(),capApiKey=$('cfgCapmonsterApiKey').value.trim(),capBaseUrl=$('cfgCapmonsterBaseUrl').value.trim(),ezApiKey=$('cfgEzcaptchaApiKey').value.trim(),ezBaseUrl=$('cfgEzcaptchaBaseUrl').value.trim(),solverApiKey=$('cfgCapsolverApiKey').value.trim(),solverBaseUrl=$('cfgCapsolverBaseUrl').value.trim(),remoteBaseUrl=$('cfgRemoteBrowserBaseUrl').value.trim(),remoteApiKey=$('cfgRemoteBrowserApiKey').value.trim(),remoteTimeout=parseInt($('cfgRemoteBrowserTimeout').value)||60,browserProxyEnabled=$('cfgBrowserProxyEnabled').checked,browserProxyUrl=$('cfgBrowserProxyUrl').value.trim(),browserCount=parseInt($('cfgBrowserCount').value)||1;console.log('保存验证码配置:',{method,yesApiKey,yesBaseUrl,capApiKey,capBaseUrl,ezApiKey,ezBaseUrl,solverApiKey,solverBaseUrl,remoteBaseUrl,remoteApiKey,remoteTimeout,browserProxyEnabled,browserProxyUrl,browserCount});try{const r=await apiRequest('/api/captcha/config',{method:'POST',body:JSON.stringify({captcha_method:method,yescaptcha_api_key:yesApiKey,yescaptcha_base_url:yesBaseUrl,capmonster_api_key:capApiKey,capmonster_base_url:capBaseUrl,ezcaptcha_api_key:ezApiKey,ezcaptcha_base_url:ezBaseUrl,capsolver_api_key:solverApiKey,capsolver_base_url:solverBaseUrl,remote_browser_base_url:remoteBaseUrl,remote_browser_api_key:remoteApiKey,remote_browser_timeout:remoteTimeout,browser_proxy_enabled:browserProxyEnabled,browser_proxy_url:browserProxyUrl,browser_count:browserCount})});if(!r){console.error('保存请求失败');return}const d=await r.json();console.log('保存结果:',d);if(d.success){showToast('验证码配置保存成功','success');await new Promise(r=>setTimeout(r,200));await loadCaptchaConfig()}else{console.error('保存失败:',d);showToast(d.message||'保存失败','error')}}catch(e){console.error('保存失败:',e);showToast('保存失败: '+e.message,'error')}},
-        updateCaptchaScoreTestResult=(message,isSuccess)=>{const el=$('captchaScoreTestResult');if(!el)return;el.textContent=message;el.className=`text-xs mt-2 ${isSuccess?'text-green-600':'text-red-600'}`},
-        testCaptchaScore=async()=>{const btn=$('btnTestCaptchaScore');if(btn){btn.disabled=true;btn.textContent='测试中...'}updateCaptchaScoreTestResult('正在按当前打码方式测试分数...',true);try{const r=await apiRequest('/api/captcha/score-test',{method:'POST',body:JSON.stringify({})});if(!r){updateCaptchaScoreTestResult('分数测试请求失败',false);return}const d=await r.json();const verify=d.verify_result||{};const score=verify.score!==undefined?verify.score:(d.score!==undefined?d.score:'-');const action=verify.action||d.action||'-';const hostname=verify.hostname||'-';const parts=[`方式: ${d.captcha_method||'-'}`,`score=${score}`,`action=${action}`,`hostname=${hostname}`,d.token_elapsed_ms!==undefined?`取token ${d.token_elapsed_ms}ms`:null,d.verify_elapsed_ms!==undefined?`校验 ${d.verify_elapsed_ms}ms`:null,d.elapsed_ms!==undefined?`总耗时 ${d.elapsed_ms}ms`:null,d.message||null].filter(Boolean);updateCaptchaScoreTestResult(parts.join(' | '),!!d.success);showToast(d.success?`分数测试成功: ${score}`:`分数测试失败: ${d.message||'未知错误'}`,d.success?'success':'error')}catch(e){updateCaptchaScoreTestResult('分数测试失败: '+e.message,false);showToast('分数测试失败: '+e.message,'error')}finally{if(btn){btn.disabled=false;btn.textContent='测试当前打码分数'}}},
+        togglePersonalProxyInput=()=>{const enabled=$('cfgPersonalProxyEnabled').checked;$('personalProxyUrlInput').classList.toggle('hidden',!enabled)},
+        loadCaptchaConfig=async()=>{try{console.log('开始加载验证码配置...');const r=await apiRequest('/api/captcha/config');if(!r){console.error('API请求失败');return}const d=await r.json();console.log('验证码配置数据:',d);$('cfgCaptchaMethod').value=d.captcha_method||'yescaptcha';$('cfgYescaptchaApiKey').value=d.yescaptcha_api_key||'';$('cfgYescaptchaBaseUrl').value=d.yescaptcha_base_url||'https://api.yescaptcha.com';$('cfgCapmonsterApiKey').value=d.capmonster_api_key||'';$('cfgCapmonsterBaseUrl').value=d.capmonster_base_url||'https://api.capmonster.cloud';$('cfgEzcaptchaApiKey').value=d.ezcaptcha_api_key||'';$('cfgEzcaptchaBaseUrl').value=d.ezcaptcha_base_url||'https://api.ez-captcha.com';$('cfgCapsolverApiKey').value=d.capsolver_api_key||'';$('cfgCapsolverBaseUrl').value=d.capsolver_base_url||'https://api.capsolver.com';$('cfgRemoteBrowserBaseUrl').value=d.remote_browser_base_url||'';$('cfgRemoteBrowserApiKey').value=d.remote_browser_api_key||'';$('cfgRemoteBrowserTimeout').value=d.remote_browser_timeout||60;$('cfgBrowserProxyEnabled').checked=d.browser_proxy_enabled||false;$('cfgBrowserProxyUrl').value=d.browser_proxy_url||'';$('cfgPersonalProxyEnabled').checked=d.browser_proxy_enabled||false;$('cfgPersonalProxyUrl').value=d.browser_proxy_url||'';$('cfgBrowserCount').value=d.browser_count||1;$('cfgPersonalProjectPoolSize').value=d.personal_project_pool_size||4;$('cfgPersonalMaxTabs').value=d.personal_max_resident_tabs||5;$('cfgPersonalIdleTTL').value=d.personal_idle_tab_ttl_seconds||600;toggleCaptchaOptions();toggleBrowserProxyInput();togglePersonalProxyInput();console.log('验证码配置加载成功')}catch(e){console.error('加载验证码配置失败:',e);showToast('加载验证码配置失败: '+e.message,'error')}},
+        saveCaptchaConfig=async()=>{const method=$('cfgCaptchaMethod').value,yesApiKey=$('cfgYescaptchaApiKey').value.trim(),yesBaseUrl=$('cfgYescaptchaBaseUrl').value.trim(),capApiKey=$('cfgCapmonsterApiKey').value.trim(),capBaseUrl=$('cfgCapmonsterBaseUrl').value.trim(),ezApiKey=$('cfgEzcaptchaApiKey').value.trim(),ezBaseUrl=$('cfgEzcaptchaBaseUrl').value.trim(),solverApiKey=$('cfgCapsolverApiKey').value.trim(),solverBaseUrl=$('cfgCapsolverBaseUrl').value.trim(),remoteBaseUrl=$('cfgRemoteBrowserBaseUrl').value.trim(),remoteApiKey=$('cfgRemoteBrowserApiKey').value.trim(),remoteTimeout=parseInt($('cfgRemoteBrowserTimeout').value)||60,browserProxyEnabled=$('cfgBrowserProxyEnabled').checked,browserProxyUrl=$('cfgBrowserProxyUrl').value.trim(),personalProxyEnabled=$('cfgPersonalProxyEnabled').checked,personalProxyUrl=$('cfgPersonalProxyUrl').value.trim(),browserCount=parseInt($('cfgBrowserCount').value)||1,personalProjectPoolSize=parseInt($('cfgPersonalProjectPoolSize').value)||4,personalMaxTabs=parseInt($('cfgPersonalMaxTabs').value)||5,personalIdleTTL=parseInt($('cfgPersonalIdleTTL').value)||600;const finalProxyEnabled=method==='personal'?personalProxyEnabled:browserProxyEnabled;const finalProxyUrl=method==='personal'?personalProxyUrl:browserProxyUrl;console.log('保存验证码配置:',{method,yesApiKey,yesBaseUrl,capApiKey,capBaseUrl,ezApiKey,ezBaseUrl,solverApiKey,solverBaseUrl,remoteBaseUrl,remoteApiKey,remoteTimeout,browserProxyEnabled,browserProxyUrl,personalProxyEnabled,personalProxyUrl,finalProxyEnabled,finalProxyUrl,browserCount,personalProjectPoolSize,personalMaxTabs,personalIdleTTL});try{const r=await apiRequest('/api/captcha/config',{method:'POST',body:JSON.stringify({captcha_method:method,yescaptcha_api_key:yesApiKey,yescaptcha_base_url:yesBaseUrl,capmonster_api_key:capApiKey,capmonster_base_url:capBaseUrl,ezcaptcha_api_key:ezApiKey,ezcaptcha_base_url:ezBaseUrl,capsolver_api_key:solverApiKey,capsolver_base_url:solverBaseUrl,remote_browser_base_url:remoteBaseUrl,remote_browser_api_key:remoteApiKey,remote_browser_timeout:remoteTimeout,browser_proxy_enabled:finalProxyEnabled,browser_proxy_url:finalProxyUrl,browser_count:browserCount,personal_project_pool_size:personalProjectPoolSize,personal_max_resident_tabs:personalMaxTabs,personal_idle_tab_ttl_seconds:personalIdleTTL})});if(!r){console.error('保存请求失败');return}const d=await r.json();console.log('保存结果:',d);if(d.success){showToast('验证码配置保存成功','success');await new Promise(r=>setTimeout(r,200));await loadCaptchaConfig()}else{console.error('保存失败:',d);showToast(d.message||'保存失败','error')}}catch(e){console.error('保存失败:',e);showToast('保存失败: '+e.message,'error')}},
         loadPluginConfig=async()=>{try{const r=await apiRequest('/api/plugin/config');if(!r)return;const d=await r.json();if(d.success&&d.config){$('cfgPluginConnectionUrl').value=d.config.connection_url||'';$('cfgPluginConnectionToken').value=d.config.connection_token||'';$('cfgAutoEnableOnUpdate').checked=d.config.auto_enable_on_update||false}}catch(e){console.error('加载插件配置失败:',e);showToast('加载插件配置失败: '+e.message,'error')}},
         savePluginConfig=async()=>{const token=$('cfgPluginConnectionToken').value.trim();const autoEnable=$('cfgAutoEnableOnUpdate').checked;try{const r=await apiRequest('/api/plugin/config',{method:'POST',body:JSON.stringify({connection_token:token,auto_enable_on_update:autoEnable})});if(!r)return;const d=await r.json();if(d.success){showToast('插件配置保存成功','success');await loadPluginConfig()}else{showToast(d.message||'保存失败','error')}}catch(e){showToast('保存失败: '+e.message,'error')}},
         copyConnectionUrl=()=>{const url=$('cfgPluginConnectionUrl').value;if(!url){showToast('连接接口为空','error');return}navigator.clipboard.writeText(url).then(()=>showToast('连接接口已复制','success')).catch(()=>showToast('复制失败','error'))},
@@ -825,19 +894,22 @@
         generateRandomToken=()=>{const chars='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';let token='';for(let i=0;i<32;i++){token+=chars.charAt(Math.floor(Math.random()*chars.length))}$('cfgPluginConnectionToken').value=token;showToast('随机Token已生成','success')},
         toggleATAutoRefresh=async()=>{try{const enabled=$('atAutoRefreshToggle').checked;const r=await apiRequest('/api/token-refresh/enabled',{method:'POST',body:JSON.stringify({enabled:enabled})});if(!r){$('atAutoRefreshToggle').checked=!enabled;return}const d=await r.json();if(d.success){showToast(enabled?'AT自动刷新已启用':'AT自动刷新已禁用','success')}else{showToast('操作失败: '+(d.detail||'未知错误'),'error');$('atAutoRefreshToggle').checked=!enabled}}catch(e){showToast('操作失败: '+e.message,'error');$('atAutoRefreshToggle').checked=!enabled}},
         loadATAutoRefreshConfig=async()=>{try{const r=await apiRequest('/api/token-refresh/config');if(!r)return;const d=await r.json();if(d.success&&d.config){$('atAutoRefreshToggle').checked=d.config.at_auto_refresh_enabled||false}else{console.error('AT自动刷新配置数据格式错误:',d)}}catch(e){console.error('加载AT自动刷新配置失败:',e)}},
-        formatLogStatus=l=>{const statusText=(l.status_text||'').trim();if(statusText){const map={started:'\u5df2\u542f\u52a8',token_selected:'\u5df2\u9009\u4e2d\u8d26\u53f7',token_ready:'\u51c6\u5907\u751f\u6210\u73af\u5883',project_ready:'\u9879\u76ee\u5df2\u5c31\u7eea',uploading_images:'\u4e0a\u4f20\u53c2\u8003\u56fe\u4e2d',submitting_image:'\u83b7\u53d6\u6253\u7801\u5e76\u63d0\u4ea4\u56fe\u7247\u4efb\u52a1',image_generated:'\u56fe\u7247\u751f\u6210\u5b8c\u6210',preparing_video:'\u51c6\u5907\u89c6\u9891\u4efb\u52a1',submitting_video:'\u83b7\u53d6\u6253\u7801\u5e76\u63d0\u4ea4\u89c6\u9891\u4efb\u52a1',video_submitted:'\u89c6\u9891\u4efb\u52a1\u5df2\u63d0\u4ea4',video_polling:'\u89c6\u9891\u751f\u6210\u4e2d',caching_image:'\u7f13\u5b58\u56fe\u7247\u4e2d',caching_video:'\u7f13\u5b58\u89c6\u9891\u4e2d',completed:'\u5df2\u5b8c\u6210',failed:'\u5931\u8d25',processing:'\u5904\u7406\u4e2d',upsampling_2k:'\u6b63\u5728\u653e\u5927\u52302K',upsampling_4k:'\u6b63\u5728\u653e\u5927\u52304K',upsampling_1080p:'\u6b63\u5728\u653e\u5927\u52301080P'};return map[statusText]||statusText}if(l.status_code===102)return'\u5904\u7406\u4e2d';if(l.status_code===200)return'\u5df2\u5b8c\u6210';if(l.status_code&&l.status_code>=400)return'\u5931\u8d25';return'-'},
+        formatLogStatus=l=>{const statusText=(l.status_text||'').trim();if(statusText){const map={started:'\u5df2\u542f\u52a8',token_selected:'\u5df2\u9009\u4e2d\u8d26\u53f7',token_ready:'\u51c6\u5907\u751f\u6210\u73af\u5883',project_ready:'\u9879\u76ee\u5df2\u5c31\u7eea',uploading_images:'\u4e0a\u4f20\u53c2\u8003\u56fe\u4e2d',solving_image_captcha:'\u56fe\u7247\u6253\u7801\u9a8c\u8bc1\u4e2d',submitting_image:'\u56fe\u7247\u63d0\u4ea4\u4e2d',image_generated:'\u56fe\u7247\u751f\u6210\u5b8c\u6210',preparing_video:'\u51c6\u5907\u89c6\u9891\u4efb\u52a1',submitting_video:'\u89c6\u9891\u63d0\u4ea4\u4e2d',video_submitted:'\u89c6\u9891\u4efb\u52a1\u5df2\u63d0\u4ea4',video_polling:'\u89c6\u9891\u751f\u6210\u4e2d',caching_image:'\u7f13\u5b58\u56fe\u7247\u4e2d',caching_video:'\u7f13\u5b58\u89c6\u9891\u4e2d',completed:'\u5df2\u5b8c\u6210',failed:'\u5931\u8d25',processing:'\u5904\u7406\u4e2d',upsampling_2k:'\u6b63\u5728\u653e\u5927\u52302K',upsampling_4k:'\u6b63\u5728\u653e\u5927\u52304K',upsampling_1080p:'\u6b63\u5728\u653e\u5927\u52301080P'};return map[statusText]||statusText}if(l.status_code===102)return'\u5904\u7406\u4e2d';if(l.status_code===200)return'\u5df2\u5b8c\u6210';if(l.status_code&&l.status_code>=400)return'\u5931\u8d25';return'-'},
         formatLogStatusClass=l=>{const statusText=formatLogStatus(l);if(statusText==='\u5904\u7406\u4e2d')return'bg-amber-50 text-amber-700';if(statusText==='\u5df2\u5b8c\u6210')return'bg-green-50 text-green-700';if(statusText==='\u5931\u8d25')return'bg-red-50 text-red-700';return'bg-gray-100 text-gray-700'},
         formatLogProgress=l=>{if(l.progress===null||l.progress===undefined||l.progress==='')return'-';const progress=Number(l.progress);return Number.isFinite(progress)?`${Math.max(0,Math.min(100,progress))}%`:'-'},
-        startLogsAutoRefresh=()=>{},
-        stopLogsAutoRefresh=()=>{},
-        loadLogs=async()=>{try{const r=await apiRequest('/api/logs?limit=100');if(!r)return;const logs=await r.json();window.allLogs=logs;window.logDetailCache=window.logDetailCache||Object.create(null);window.logListMeta=Object.create(null);logs.forEach(l=>window.logListMeta[l.id]={updated_at:l.updated_at,created_at:l.created_at,status_code:l.status_code,progress:l.progress,status_text:l.status_text});Object.keys(window.logDetailCache).forEach(key=>{const meta=window.logListMeta[key];const cached=window.logDetailCache[key];if(!meta||!cached||cached.updated_at!==meta.updated_at)delete window.logDetailCache[key]});const tb=$('logsTableBody');if(!logs.length){tb.innerHTML='<tr><td colspan="8" class="py-8 px-3 text-center text-sm text-muted-foreground">\u6682\u65e0\u65e5\u5fd7</td></tr>';return}tb.innerHTML=logs.map(l=>{const statusText=formatLogStatus(l),progressText=formatLogProgress(l),statusCodeClass=l.status_code===102?'bg-amber-50 text-amber-700':(l.status_code===200?'bg-green-50 text-green-700':'bg-red-50 text-red-700');return`<tr><td class="py-2.5 px-3">${escapeLogHtml(l.operation||'-')}</td><td class="py-2.5 px-3"><span class="text-xs ${l.token_email?'text-blue-600':'text-muted-foreground'}">${escapeLogHtml(l.token_email||'\u672a\u77e5')}</span></td><td class="py-2.5 px-3"><span class="inline-flex items-center rounded px-2 py-0.5 text-xs ${formatLogStatusClass(l)}">${escapeLogHtml(statusText)}</span></td><td class="py-2.5 px-3 text-xs">${escapeLogHtml(progressText)}</td><td class="py-2.5 px-3"><span class="inline-flex items-center rounded px-2 py-0.5 text-xs ${statusCodeClass}">${escapeLogHtml(l.status_code??'-')}</span></td><td class="py-2.5 px-3">${Number(l.duration||0).toFixed(2)}</td><td class="py-2.5 px-3 text-xs text-muted-foreground">${l.created_at?new Date(l.created_at).toLocaleString('zh-CN'):'-'}</td><td class="py-2.5 px-3"><button onclick="showLogDetail(${l.id})" class="inline-flex items-center justify-center rounded-md hover:bg-blue-50 hover:text-blue-700 h-7 px-2 text-xs">&#35814;&#24773;</button></td></tr>`}).join('');if(window.activeLogDetailId&&window.logListMeta[window.activeLogDetailId])await showLogDetail(window.activeLogDetailId)}catch(e){console.error('load logs failed:',e);showToast('\u52a0\u8f7d\u65e5\u5fd7\u5931\u8d25: '+e.message,'error')}},
+        getLogOperationLabel=l=>{const operation=String(l&&l.operation||'').trim();if(operation==='generate_image')return'图片';if(operation==='generate_video')return'视频';return''},
+        formatLogOutcome=l=>{const statusCode=Number(l&&l.status_code);if(statusCode===200){const operationLabel=getLogOperationLabel(l);return operationLabel?`${operationLabel}结果已返回`:'已返回结果'}if(statusCode===102)return'处理中';const errorSummary=extractLogErrorSummary(l);if(errorSummary)return truncateLogText(errorSummary,96);return statusCode>=400?'请求失败':'-'},
+        formatLogOutcomeClass=l=>{if((l.status_code||0)>=400)return'text-red-600';if(l.status_code===200)return'text-green-700';if(l.status_code===102)return'text-amber-700';return'text-muted-foreground'},
+        startLogsAutoRefresh=()=>{stopLogsAutoRefresh()},
+        stopLogsAutoRefresh=()=>{if(window.logsAutoRefreshTimer){clearInterval(window.logsAutoRefreshTimer);window.logsAutoRefreshTimer=null}},
+        loadLogs=async(opts={})=>{const silent=!!opts.silent;try{const r=await apiRequest('/api/logs?limit=100');if(!r)return;const logs=await r.json();window.allLogs=logs;window.logDetailCache=window.logDetailCache||Object.create(null);window.logListMeta=Object.create(null);logs.forEach(l=>window.logListMeta[l.id]={updated_at:l.updated_at,created_at:l.created_at,status_code:l.status_code,progress:l.progress,status_text:l.status_text,error_summary:l.error_summary||''});Object.keys(window.logDetailCache).forEach(key=>{const meta=window.logListMeta[key];const cached=window.logDetailCache[key];if(!meta||!cached||cached.updated_at!==meta.updated_at)delete window.logDetailCache[key]});const tb=$('logsTableBody');if(!logs.length){tb.innerHTML='<tr><td colspan="9" class="py-8 px-3 text-center text-sm text-muted-foreground">\u6682\u65e0\u65e5\u5fd7</td></tr>';return}tb.innerHTML=logs.map(l=>{const statusText=formatLogStatus(l),progressText=formatLogProgress(l),outcomeText=formatLogOutcome(l),outcomePreview=truncateLogText(outcomeText,96),statusCodeClass=l.status_code===102?'bg-amber-50 text-amber-700':(l.status_code===200?'bg-green-50 text-green-700':'bg-red-50 text-red-700');return`<tr><td class="py-2.5 px-3">${escapeLogHtml(l.operation||'-')}</td><td class="py-2.5 px-3"><span class="text-xs ${l.token_email?'text-blue-600':'text-muted-foreground'}">${escapeLogHtml(l.token_email||'\u672a\u77e5')}</span></td><td class="py-2.5 px-3"><span class="inline-flex items-center rounded px-2 py-0.5 text-xs ${formatLogStatusClass(l)}">${escapeLogHtml(statusText)}</span></td><td class="py-2.5 px-3 text-xs">${escapeLogHtml(progressText)}</td><td class="py-2.5 px-3"><span class="inline-flex items-center rounded px-2 py-0.5 text-xs ${statusCodeClass}">${escapeLogHtml(l.status_code??'-')}</span></td><td class="py-2.5 px-3 align-top"><div class="w-[17rem] max-w-[17rem] text-xs leading-5 whitespace-pre-wrap break-words line-clamp-2 ${formatLogOutcomeClass(l)}" title="${escapeLogHtml(outcomeText)}">${escapeLogHtml(outcomePreview)}</div></td><td class="py-2.5 px-3">${Number(l.duration||0).toFixed(2)}</td><td class="py-2.5 px-3 text-xs text-muted-foreground">${l.created_at?new Date(l.created_at).toLocaleString('zh-CN'):'-'}</td><td class="py-2.5 px-3"><button onclick="showLogDetail(${l.id})" class="inline-flex items-center justify-center rounded-md hover:bg-blue-50 hover:text-blue-700 h-7 px-2 text-xs">&#35814;&#24773;</button></td></tr>`}).join('');if(window.activeLogDetailId&&window.logListMeta[window.activeLogDetailId])await showLogDetail(window.activeLogDetailId,{silent:true})}catch(e){console.error('load logs failed:',e);if(!silent)showToast('\u52a0\u8f7d\u65e5\u5fd7\u5931\u8d25: '+e.message,'error')}},
         refreshLogs=async()=>{await loadLogs()},
         clearAllLogs=async()=>{if(!confirm('确定要清空所有日志吗？此操作不可恢复！'))return;try{const r=await apiRequest('/api/logs',{method:'DELETE'});if(!r)return;const d=await r.json();if(d.success){window.logDetailCache=Object.create(null);window.activeLogDetailId=null;resetLogMediaCache();showToast('日志已清空','success');await loadLogs()}else{showToast('清空失败: '+(d.message||'未知错误'),'error')}}catch(e){showToast('清空失败: '+e.message,'error')}},
-        showLogDetail=async(logId)=>{const modal=$('logDetailModal');const content=$('logDetailContent');window.logDetailCache=window.logDetailCache||Object.create(null);window.logListMeta=window.logListMeta||Object.create(null);window.logDetailRequestSeq=(window.logDetailRequestSeq||0)+1;const requestSeq=window.logDetailRequestSeq;window.activeLogDetailId=logId;modal.classList.remove('hidden');content.innerHTML='<div class="rounded-md border border-border p-4 bg-muted/30 text-sm text-muted-foreground">\u65e5\u5fd7\u8be6\u60c5\u52a0\u8f7d\u4e2d...</div>';try{const meta=window.logListMeta[logId];let log=window.logDetailCache[logId];if(!log||!meta||log.updated_at!==meta.updated_at){const r=await apiRequest(`/api/logs/${logId}`);if(!r)return;if(window.logDetailRequestSeq!==requestSeq||window.activeLogDetailId!==logId||modal.classList.contains('hidden'))return;if(r.status===404){content.innerHTML='<div class="rounded-md border border-red-200 p-4 bg-red-50 text-sm text-red-700">\u65e5\u5fd7\u4e0d\u5b58\u5728\u6216\u5df2\u88ab\u5220\u9664</div>';return}log=await r.json();window.logDetailCache[logId]=log}if(window.logDetailRequestSeq!==requestSeq||window.activeLogDetailId!==logId||modal.classList.contains('hidden'))return;renderLogDetail(log)}catch(e){if(window.logDetailRequestSeq!==requestSeq||window.activeLogDetailId!==logId||modal.classList.contains('hidden'))return;console.error('\u52a0\u8f7d\u65e5\u5fd7\u8be6\u60c5\u5931\u8d25:',e);content.innerHTML=`<div class="rounded-md border border-red-200 p-4 bg-red-50 text-sm text-red-700">\u52a0\u8f7d\u65e5\u5fd7\u8be6\u60c5\u5931\u8d25: ${escapeLogHtml(e.message||'\u672a\u77e5\u9519\u8bef')}</div>`;showToast('\u52a0\u8f7d\u65e5\u5fd7\u8be6\u60c5\u5931\u8d25: '+e.message,'error')}},
+        showLogDetail=async(logId,opts={})=>{const silent=!!opts.silent;const modal=$('logDetailModal');const content=$('logDetailContent');window.logDetailCache=window.logDetailCache||Object.create(null);window.logListMeta=window.logListMeta||Object.create(null);window.logDetailRequestSeq=(window.logDetailRequestSeq||0)+1;const requestSeq=window.logDetailRequestSeq;window.activeLogDetailId=logId;modal.classList.remove('hidden');content.innerHTML='<div class="rounded-md border border-border p-4 bg-muted/30 text-sm text-muted-foreground">\u65e5\u5fd7\u8be6\u60c5\u52a0\u8f7d\u4e2d...</div>';try{const meta=window.logListMeta[logId];let log=window.logDetailCache[logId];if(!log||!meta||log.updated_at!==meta.updated_at){const r=await apiRequest(`/api/logs/${logId}`);if(!r)return;if(window.logDetailRequestSeq!==requestSeq||window.activeLogDetailId!==logId||modal.classList.contains('hidden'))return;if(r.status===404){content.innerHTML='<div class="rounded-md border border-red-200 p-4 bg-red-50 text-sm text-red-700">\u65e5\u5fd7\u4e0d\u5b58\u5728\u6216\u5df2\u88ab\u5220\u9664</div>';return}log=await r.json();window.logDetailCache[logId]=log}if(window.logDetailRequestSeq!==requestSeq||window.activeLogDetailId!==logId||modal.classList.contains('hidden'))return;renderLogDetail(log)}catch(e){if(window.logDetailRequestSeq!==requestSeq||window.activeLogDetailId!==logId||modal.classList.contains('hidden'))return;console.error('\u52a0\u8f7d\u65e5\u5fd7\u8be6\u60c5\u5931\u8d25:',e);content.innerHTML=`<div class="rounded-md border border-red-200 p-4 bg-red-50 text-sm text-red-700">\u52a0\u8f7d\u65e5\u5fd7\u8be6\u60c5\u5931\u8d25: ${escapeLogHtml(e.message||'\u672a\u77e5\u9519\u8bef')}</div>`;if(!silent)showToast('\u52a0\u8f7d\u65e5\u5fd7\u8be6\u60c5\u5931\u8d25: '+e.message,'error')}},
         closeLogDetailModal=()=>{window.activeLogDetailId=null;resetLogMediaCache();$('logDetailModal').classList.add('hidden')},
         showToast=(m,t='info')=>{const d=document.createElement('div'),bc={success:'bg-green-600',error:'bg-destructive',info:'bg-primary'};d.className=`fixed bottom-4 right-4 ${bc[t]||bc.info} text-white px-4 py-2.5 rounded-lg shadow-lg text-sm font-medium z-50 animate-slide-up`;d.textContent=m;document.body.appendChild(d);setTimeout(()=>{d.style.opacity='0';d.style.transition='opacity .3s';setTimeout(()=>d.parentNode&&document.body.removeChild(d),300)},2000)},
         logout=()=>{if(!confirm('确定要退出登录吗?'))return;localStorage.removeItem('adminToken');location.href='/login'},
-        switchTab=t=>{const cap=n=>n.charAt(0).toUpperCase()+n.slice(1);['tokens','settings','logs'].forEach(n=>{const active=n===t;$(`panel${cap(n)}`).classList.toggle('hidden',!active);$(`tab${cap(n)}`).classList.toggle('border-primary',active);$(`tab${cap(n)}`).classList.toggle('text-primary',active);$(`tab${cap(n)}`).classList.toggle('border-transparent',!active);$(`tab${cap(n)}`).classList.toggle('text-muted-foreground',!active)});if(t==='settings'){loadAdminConfig();loadProxyConfig();loadCacheConfig();loadGenerationTimeout();loadCaptchaConfig();loadPluginConfig();loadATAutoRefreshConfig()}else if(t==='logs'){loadLogs()}};
+        switchTab=t=>{const cap=n=>n.charAt(0).toUpperCase()+n.slice(1);['tokens','settings','logs'].forEach(n=>{const active=n===t;$(`panel${cap(n)}`).classList.toggle('hidden',!active);$(`tab${cap(n)}`).classList.toggle('border-primary',active);$(`tab${cap(n)}`).classList.toggle('text-primary',active);$(`tab${cap(n)}`).classList.toggle('border-transparent',!active);$(`tab${cap(n)}`).classList.toggle('text-muted-foreground',!active)});if(t==='settings'){stopLogsAutoRefresh();loadAdminConfig();loadProxyConfig();loadCacheConfig();loadGenerationTimeout();loadCallLogicConfig();loadCaptchaConfig();loadPluginConfig();loadATAutoRefreshConfig()}else if(t==='logs'){startLogsAutoRefresh();loadLogs()}else{stopLogsAutoRefresh()}};
 
         function escapeLogHtml(text){
             if(text===null||text===undefined) return '';
@@ -847,6 +919,65 @@
         function parseLogJson(raw){
             if(!raw) return null;
             try{return JSON.parse(raw)}catch(_){return null}
+        }
+
+        function truncateLogText(text,limit=240){
+            const value=String(text??'').trim().replace(/\s+/g,' ');
+            if(!value) return '';
+            return value.length<=limit?value:`${value.slice(0,limit-3)}...`;
+        }
+
+        function extractLogErrorSummary(log,responseBodyObj){
+            const direct=log&&typeof log.error_summary==='string'?log.error_summary.trim():'';
+            if(direct) return truncateLogText(direct);
+            const payload=responseBodyObj===undefined?parseLogJson(log&&log.response_body):responseBodyObj;
+            const visit=value=>{
+                if(value===null||value===undefined) return '';
+                if(typeof value==='string') return truncateLogText(value);
+                if(Array.isArray(value)){for(const item of value){const nested=visit(item);if(nested)return nested}return''}
+                if(typeof value==='object'){
+                    for(const key of ['error_summary','error_message','detail','message']){
+                        if(typeof value[key]==='string'&&value[key].trim()) return truncateLogText(value[key]);
+                    }
+                    const errorValue=value.error;
+                    if(typeof errorValue==='string'&&errorValue.trim()) return truncateLogText(errorValue);
+                    if(errorValue&&typeof errorValue==='object'){
+                        for(const key of ['message','detail','reason','code']){
+                            if(typeof errorValue[key]==='string'&&errorValue[key].trim()) return truncateLogText(errorValue[key]);
+                        }
+                    }
+                    for(const key of ['response','data','performance']){
+                        const nested=visit(value[key]);
+                        if(nested) return nested;
+                    }
+                }
+                return '';
+            };
+            const summary=visit(payload);
+            if(summary) return summary;
+            if(log&&log.response_body&&!payload) return truncateLogText(log.response_body);
+            return '';
+        }
+
+        function extractLogPrimaryUrl(responseBodyObj){
+            if(!responseBodyObj||typeof responseBodyObj!=='object') return null;
+            return responseBodyObj.url||((responseBodyObj.data&&responseBodyObj.data[0]&&responseBodyObj.data[0].url)?responseBodyObj.data[0].url:null)||(responseBodyObj.generated_assets&&responseBodyObj.generated_assets.final_video_url)||((responseBodyObj.generated_assets&&responseBodyObj.generated_assets.upscaled_image&&responseBodyObj.generated_assets.upscaled_image.local_url)?responseBodyObj.generated_assets.upscaled_image.local_url:null)||((responseBodyObj.generated_assets&&responseBodyObj.generated_assets.upscaled_image&&responseBodyObj.generated_assets.upscaled_image.url)?responseBodyObj.generated_assets.upscaled_image.url:null)||(responseBodyObj.generated_assets&&responseBodyObj.generated_assets.final_image_url)||null;
+        }
+
+        function extractLogSuccessSummary(log,responseBodyObj){
+            if((log&&Number(log.status_code))!==200) return '';
+            if(!responseBodyObj||typeof responseBodyObj!=='object') return '生成成功，已返回结果';
+            const assets=responseBodyObj.generated_assets;
+            if(assets&&typeof assets==='object'&&assets.upscaled_image&&typeof assets.upscaled_image==='object'){
+                return `生成成功，已返回${assets.upscaled_image.resolution||'高清'}结果`;
+            }
+            const directUrl=extractLogPrimaryUrl(responseBodyObj);
+            if(directUrl){
+                if(isVideoUrl(directUrl)) return '生成成功，已返回视频结果';
+                if(isImageUrl(directUrl)) return '生成成功，已返回图片结果';
+                return '生成成功，已返回结果地址';
+            }
+            return responseBodyObj.status==='success'?'生成成功':'生成成功，已返回结果';
         }
 
         function formatLogPayload(raw){
@@ -912,12 +1043,28 @@
             return key;
         }
 
+        function normalizeLogMediaUrl(url){
+            if(!url) return '';
+            const text=String(url).trim();
+            if(!text||/^data:/i.test(text)) return text;
+            try{
+                const parsed=new URL(text,window.location.origin);
+                if(parsed.pathname.startsWith('/tmp/')){
+                    return `${window.location.origin}${parsed.pathname}${parsed.search}${parsed.hash}`;
+                }
+                return parsed.toString();
+            }catch(_){
+                return text;
+            }
+        }
+
         function renderLogLink(label,url){
             if(!url) return '';
-            if(/^data:/i.test(String(url))){
-                return `<p class="text-xs"><span class="font-medium">${label}:</span> <span class="text-muted-foreground">data URL（长度 ${String(url).length}）</span></p>`;
+            const normalizedUrl=normalizeLogMediaUrl(url);
+            if(/^data:/i.test(String(normalizedUrl))){
+                return `<p class="text-xs"><span class="font-medium">${label}:</span> <span class="text-muted-foreground">data URL（长度 ${String(normalizedUrl).length}）</span></p>`;
             }
-            const safeUrl=escapeLogHtml(url);
+            const safeUrl=escapeLogHtml(normalizedUrl);
             return `<p class="text-xs"><span class="font-medium">${label}:</span> <a href="${safeUrl}" target="_blank" class="text-blue-600 hover:underline break-all">${safeUrl}</a></p>`;
         }
 
@@ -937,10 +1084,18 @@
 
         function renderMediaPreview(label,url,withUrl=true){
             if(!url) return '';
-            const mediaType=isVideoUrl(url)?'video':(isImageUrl(url)?'image':'');
-            const mediaKey=mediaType?cacheLogMediaUrl(url):'';
+            const previewUrl=normalizeLogMediaUrl(url);
+            const mediaType=isVideoUrl(previewUrl)?'video':(isImageUrl(previewUrl)?'image':'');
+            const mediaKey=mediaType?cacheLogMediaUrl(previewUrl):'';
             const previewTrigger=mediaType?`<button onclick="loadLogMediaPreview(this)" data-media-key="${mediaKey}" data-label="${escapeLogHtml(label)}" data-media-type="${mediaType}" class="inline-flex items-center justify-center rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">点击加载预览</button><div class="space-y-2"></div>`:'';
-            return `<div class="space-y-2"><p class="text-xs font-medium">${escapeLogHtml(label)}</p>${withUrl?renderLogLink('URL',url):''}${previewTrigger}</div>`;
+            return `<div class="space-y-2"><p class="text-xs font-medium">${escapeLogHtml(label)}</p>${withUrl?renderLogLink('URL',previewUrl):''}${previewTrigger}</div>`;
+        }
+
+        function handleLogMediaPreviewError(node){
+            if(!node) return;
+            const mediaUrl=node.dataset.mediaUrl||'';
+            const mediaLabel=node.dataset.mediaLabel||'媒体';
+            node.outerHTML=`<div class="rounded-md border border-red-200 bg-red-50 p-3 text-xs text-red-700 space-y-2"><p>${escapeLogHtml(mediaLabel)}预览加载失败，请直接打开链接查看。</p>${renderLogLink('URL',mediaUrl)}</div>`;
         }
 
         function loadLogMediaPreview(button){
@@ -952,9 +1107,9 @@
             const mediaType=button.dataset.mediaType||'';
             if(!container||!url||!mediaType) return;
             if(mediaType==='video'){
-                container.innerHTML=`<video src="${escapeLogHtml(url)}" controls preload="metadata" class="w-full max-h-80 rounded-md border border-border bg-black"></video>`;
+                container.innerHTML=`<video src="${escapeLogHtml(url)}" controls preload="metadata" data-media-url="${escapeLogHtml(url)}" data-media-label="${escapeLogHtml(label)}" onerror="handleLogMediaPreviewError(this)" class="w-full max-h-80 rounded-md border border-border bg-black"></video>`;
             }else{
-                container.innerHTML=`<img src="${escapeLogHtml(url)}" alt="${escapeLogHtml(label)}" loading="lazy" decoding="async" class="max-h-80 rounded-md border border-border object-contain bg-background">`;
+                container.innerHTML=`<img src="${escapeLogHtml(url)}" alt="${escapeLogHtml(label)}" loading="lazy" decoding="async" data-media-url="${escapeLogHtml(url)}" data-media-label="${escapeLogHtml(label)}" onerror="handleLogMediaPreviewError(this)" class="max-h-80 rounded-md border border-border object-contain bg-background">`;
             }
             button.remove();
         }
@@ -962,20 +1117,22 @@
         function renderLogDetail(log){
             if(!log){showToast('日志不存在','error');return}
             resetLogMediaCache();
-            const requestBodyObj=parseLogJson(log.request_body);
             const responseBodyObj=parseLogJson(log.response_body);
             const requestPayloadText=formatLogPayload(log.request_body);
             const responsePayloadText=formatLogPayload(log.response_body);
             const toggleLogId=String(log.id??'');
-            const fullResponseOpen=getLogDetailToggleState(toggleLogId,'full_response');
-            const upscaledBase64Open=getLogDetailToggleState(toggleLogId,'upscaled_base64');
+            const errorSummary=extractLogErrorSummary(log,responseBodyObj);
+            const successSummary=extractLogSuccessSummary(log,responseBodyObj);
             let detailHtml='';
 
             detailHtml+=`<div class="space-y-2"><h4 class="font-medium text-sm">请求数据</h4><pre class="rounded-md border border-border p-3 bg-muted/30 text-xs overflow-x-auto">${escapeLogHtml(requestPayloadText)}</pre></div>`;
 
             if(log.status_code===200){
+                if(successSummary){
+                    detailHtml+=`<div class="space-y-2"><h4 class="font-medium text-sm text-green-700">结果摘要</h4><div class="rounded-md border border-green-200 p-3 bg-green-50"><p class="text-sm text-green-700">${escapeLogHtml(successSummary)}</p></div></div>`;
+                }
                 if(responseBodyObj){
-                    const directUrl=responseBodyObj.url||((responseBodyObj.data&&responseBodyObj.data[0]&&responseBodyObj.data[0].url)?responseBodyObj.data[0].url:null);
+                    const directUrl=extractLogPrimaryUrl(responseBodyObj);
                     if(directUrl){
                         detailHtml+=`<div class="space-y-2"><h4 class="font-medium text-sm">生成结果</h4><div class="rounded-md border border-border p-3 bg-muted/30 space-y-3">${renderMediaPreview('主结果',directUrl)}</div></div>`;
                     }
@@ -990,7 +1147,7 @@
                             const upPreviewUrl=up.local_url||up.url||null;
                             assetsHtml+=`<p class="text-xs"><span class="font-medium">放大分辨率:</span> ${escapeLogHtml(upResolution)}</p>`;
                             if(upPreviewUrl){
-                                assetsHtml+=renderMediaPreview(`${upResolution}结果`,upPreviewUrl,false);
+                                assetsHtml+=renderMediaPreview(`${upResolution}结果`,upPreviewUrl,!/^data:/i.test(String(upPreviewUrl||'')));
                             }
                             if(up.base64){
                                 const preview=String(up.base64).length>600?`${String(up.base64).slice(0,600)}...`:String(up.base64);
@@ -1011,13 +1168,13 @@
                     detailHtml+=`<div class="space-y-2"><h4 class="font-medium text-sm">响应数据</h4><pre class="rounded-md border border-border p-3 bg-muted/30 text-xs overflow-x-auto">${escapeLogHtml(responsePayloadText)}</pre></div>`;
                 }
             }else{
-                if(responseBodyObj&&responseBodyObj.error){
-                    detailHtml+=`<div class="space-y-2"><h4 class="font-medium text-sm text-red-600">错误原因</h4><div class="rounded-md border border-red-200 p-3 bg-red-50"><p class="text-sm text-red-700">${escapeLogHtml(responseBodyObj.error.message||responseBodyObj.error||'未知错误')}</p></div></div>`;
+                if(errorSummary){
+                    detailHtml+=`<div class="space-y-2"><h4 class="font-medium text-sm text-red-600">错误原因</h4><div class="rounded-md border border-red-200 p-3 bg-red-50"><p class="text-sm text-red-700 break-all">${escapeLogHtml(errorSummary)}</p></div></div>`;
                 }
                 detailHtml+=`<div class="space-y-2"><h4 class="font-medium text-sm text-red-600">错误响应</h4><pre class="rounded-md border border-red-200 p-3 bg-red-50 text-xs overflow-x-auto">${escapeLogHtml(responsePayloadText)}</pre></div>`;
             }
 
-            detailHtml+=`<div class="space-y-2 pt-4 border-t border-border"><h4 class="font-medium text-sm">基本信息</h4><div class="grid grid-cols-2 gap-2 text-sm"><div><span class="text-muted-foreground">操作:</span> ${escapeLogHtml(log.operation||'-')}</div><div><span class="text-muted-foreground">状态码:</span> <span class="inline-flex items-center rounded px-2 py-0.5 text-xs ${log.status_code===200?'bg-green-50 text-green-700':'bg-red-50 text-red-700'}">${escapeLogHtml(log.status_code??'-')}</span></div><div><span class="text-muted-foreground">耗时:</span> ${Number(log.duration||0).toFixed(2)}秒</div><div><span class="text-muted-foreground">时间:</span> ${log.created_at?new Date(log.created_at).toLocaleString('zh-CN'):'-'}</div><div><span class="text-muted-foreground">Token:</span> ${escapeLogHtml(log.token_email||log.token_username||'未知')}</div><div><span class="text-muted-foreground">日志ID:</span> ${escapeLogHtml(log.id??'-')}</div></div></div>`;
+            detailHtml+=`<div class="space-y-2 pt-4 border-t border-border"><h4 class="font-medium text-sm">基本信息</h4><div class="grid grid-cols-2 gap-2 text-sm"><div><span class="text-muted-foreground">操作:</span> ${escapeLogHtml(log.operation||'-')}</div><div><span class="text-muted-foreground">状态:</span> ${escapeLogHtml(formatLogStatus(log))}</div><div><span class="text-muted-foreground">状态码:</span> <span class="inline-flex items-center rounded px-2 py-0.5 text-xs ${log.status_code===200?'bg-green-50 text-green-700':(log.status_code===102?'bg-amber-50 text-amber-700':'bg-red-50 text-red-700')}">${escapeLogHtml(log.status_code??'-')}</span></div><div><span class="text-muted-foreground">耗时:</span> ${Number(log.duration||0).toFixed(2)}秒</div><div><span class="text-muted-foreground">时间:</span> ${log.created_at?new Date(log.created_at).toLocaleString('zh-CN'):'-'}</div><div><span class="text-muted-foreground">Token:</span> ${escapeLogHtml(log.token_email||log.token_username||'未知')}</div><div><span class="text-muted-foreground">日志ID:</span> ${escapeLogHtml(log.id??'-')}</div><div><span class="text-muted-foreground">进度:</span> ${escapeLogHtml(formatLogProgress(log))}</div></div></div>`;
 
             const detailContent=$('logDetailContent');detailContent.dataset.logId=String(log.id??'');detailContent.innerHTML=detailHtml;syncLogDetailViewState();
         }

@@ -1,8 +1,6 @@
 """Admin API routes"""
 import asyncio
 import json
-import urllib.error
-import urllib.request
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -10,6 +8,8 @@ from typing import Optional, List, Dict, Any
 import secrets
 import time
 import re
+import urllib.error
+import urllib.request
 from urllib.parse import urlparse
 from curl_cffi.requests import AsyncSession
 from ..core.auth import AuthManager
@@ -18,6 +18,11 @@ from ..core.config import config
 from ..services.token_manager import TokenManager
 from ..services.proxy_manager import ProxyManager
 from ..services.concurrency_manager import ConcurrencyManager
+
+try:
+    import httpx
+except ImportError:
+    httpx = None
 
 router = APIRouter()
 
@@ -38,6 +43,61 @@ def _mask_token(token: Optional[str]) -> str:
     if len(token) <= 24:
         return token
     return f"{token[:18]}...{token[-8:]}"
+
+
+def _truncate_text(text: Any, limit: int = 240) -> str:
+    value = str(text or "").strip()
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit - 3]}..."
+
+
+def _extract_error_summary(payload: Any) -> str:
+    """从响应体里提取用户可读的错误摘要。"""
+    if payload is None:
+        return ""
+
+    if isinstance(payload, str):
+        raw = payload.strip()
+        if not raw:
+            return ""
+        try:
+            return _extract_error_summary(json.loads(raw))
+        except Exception:
+            return _truncate_text(raw)
+
+    if isinstance(payload, dict):
+        for key in ("error_summary", "error_message", "detail", "message"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return _truncate_text(value)
+
+        error_value = payload.get("error")
+        if isinstance(error_value, dict):
+            for key in ("message", "detail", "reason", "code"):
+                value = error_value.get(key)
+                if isinstance(value, str) and value.strip():
+                    return _truncate_text(value)
+        elif isinstance(error_value, str) and error_value.strip():
+            return _truncate_text(error_value)
+
+        for nested_key in ("response", "data"):
+            nested = payload.get(nested_key)
+            if isinstance(nested, (dict, list, str)):
+                summary = _extract_error_summary(nested)
+                if summary:
+                    return summary
+
+        return ""
+
+    if isinstance(payload, list):
+        for item in payload:
+            summary = _extract_error_summary(item)
+            if summary:
+                return summary
+        return ""
+
+    return _truncate_text(payload)
 
 
 def _guess_client_hints_from_user_agent(user_agent: str) -> Dict[str, str]:
@@ -123,7 +183,29 @@ def _get_remote_browser_client_config() -> tuple[str, str, int]:
     return base_url, api_key, timeout
 
 
-def _sync_json_http_request(
+def _build_remote_browser_http_timeout(read_timeout: float) -> Any:
+    read_value = max(3.0, float(read_timeout))
+    write_value = min(10.0, max(3.0, read_value))
+    if httpx is None:
+        return read_value
+    return httpx.Timeout(
+        connect=2.5,
+        read=read_value,
+        write=write_value,
+        pool=2.5,
+    )
+
+
+def _parse_json_response_text(text: str) -> Optional[Any]:
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+async def _stdlib_json_http_request(
     method: str,
     url: str,
     headers: Dict[str, str],
@@ -132,36 +214,85 @@ def _sync_json_http_request(
 ) -> tuple[int, Optional[Any], str]:
     req_headers = dict(headers or {})
     req_headers.setdefault("Accept", "application/json")
+    request_method = (method or "GET").upper()
+    request_data: Optional[bytes] = None
 
-    data = None
     if payload is not None:
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req_headers["Content-Type"] = "application/json; charset=utf-8"
+        if request_method != "GET":
+            request_data = json.dumps(payload).encode("utf-8")
 
-    request = urllib.request.Request(
-        url=url,
-        data=data,
-        headers=req_headers,
-        method=(method or "GET").upper(),
-    )
+    def do_request() -> tuple[int, str]:
+        request = urllib.request.Request(
+            url=url,
+            data=request_data,
+            headers=req_headers,
+            method=request_method,
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(request, timeout=max(1.0, float(timeout))) as response:
+                status_code = int(getattr(response, "status", 0) or response.getcode() or 0)
+                body = response.read()
+                charset = response.headers.get_content_charset() or "utf-8"
+                return status_code, body.decode(charset, errors="replace")
+        except urllib.error.HTTPError as exc:
+            body = exc.read()
+            charset = exc.headers.get_content_charset() if exc.headers else None
+            return int(getattr(exc, "code", 0) or 0), body.decode(charset or "utf-8", errors="replace")
 
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            status_code = int(response.getcode() or 0)
-            raw_body = response.read()
-    except urllib.error.HTTPError as e:
-        status_code = int(getattr(e, "code", 500))
-        raw_body = e.read() if hasattr(e, "read") else b""
+        status_code, text = await asyncio.to_thread(do_request)
     except Exception as e:
         raise RuntimeError(f"远程打码服务请求失败: {e}") from e
 
-    text = raw_body.decode("utf-8", errors="replace") if raw_body else ""
-    parsed: Optional[Any] = None
-    if text:
-        try:
-            parsed = json.loads(text)
-        except Exception:
-            parsed = None
+    return status_code, _parse_json_response_text(text), text
+
+
+async def _sync_json_http_request(
+    method: str,
+    url: str,
+    headers: Dict[str, str],
+    payload: Optional[Dict[str, Any]],
+    timeout: int,
+) -> tuple[int, Optional[Any], str]:
+    req_headers = dict(headers or {})
+    req_headers.setdefault("Accept", "application/json")
+    request_method = (method or "GET").upper()
+    request_kwargs: Dict[str, Any] = {
+        "headers": req_headers,
+        "timeout": _build_remote_browser_http_timeout(timeout),
+    }
+
+    if payload is not None:
+        req_headers["Content-Type"] = "application/json; charset=utf-8"
+        if request_method != "GET":
+            request_kwargs["json"] = payload
+
+    if httpx is None:
+        return await _stdlib_json_http_request(
+            method=method,
+            url=url,
+            headers=req_headers,
+            payload=payload,
+            timeout=timeout,
+        )
+
+    try:
+        # remote_browser 控制面是服务间 JSON API，使用 httpx 避免 curl_cffi 在当前
+        # Windows + impersonate 场景下 POST body 丢失导致 FastAPI 直接判定 body 缺失。
+        async with httpx.AsyncClient(follow_redirects=False, trust_env=False) as session:
+            response = await session.request(
+                method=request_method,
+                url=url,
+                **request_kwargs,
+            )
+    except Exception as e:
+        raise RuntimeError(f"远程打码服务请求失败: {e}") from e
+
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    text = response.text or ""
+    parsed = _parse_json_response_text(text)
 
     return status_code, parsed, text
 
@@ -238,11 +369,12 @@ async def _solve_recaptcha_with_api_service(
     create_url = f"{base_url.rstrip('/')}/createTask"
     get_url = f"{base_url.rstrip('/')}/getTaskResult"
 
+    # Do not use curl_cffi impersonation for captcha API JSON endpoints: some ASGI servers
+    # (for example FastAPI/Uvicorn) may receive an empty body and return 422.
     async with AsyncSession() as session:
         create_resp = await session.post(
             create_url,
             json={"clientKey": client_key, "task": task},
-            impersonate="chrome120",
             timeout=30
         )
         create_json = create_resp.json()
@@ -256,7 +388,6 @@ async def _solve_recaptcha_with_api_service(
             poll_resp = await session.post(
                 get_url,
                 json={"clientKey": client_key, "taskId": task_id},
-                impersonate="chrome120",
                 timeout=30
             )
             poll_json = poll_resp.json()
@@ -294,13 +425,12 @@ async def _score_test_with_remote_browser_service(
         "enterprise": enterprise,
     }
 
-    status_code, response_payload, response_text = await asyncio.to_thread(
-        _sync_json_http_request,
-        "POST",
-        endpoint,
-        {"Authorization": f"Bearer {api_key}"},
-        request_payload,
-        timeout,
+    status_code, response_payload, response_text = await _sync_json_http_request(
+        method="POST",
+        url=endpoint,
+        headers={"Authorization": f"Bearer {api_key}"},
+        payload=request_payload,
+        timeout=timeout,
     )
 
     if status_code >= 400:
@@ -380,6 +510,10 @@ class CaptchaScoreTestRequest(BaseModel):
 class GenerationConfigRequest(BaseModel):
     image_timeout: int
     video_timeout: int
+
+
+class CallLogicConfigRequest(BaseModel):
+    call_mode: str
 
 
 class ChangePasswordRequest(BaseModel):
@@ -638,6 +772,8 @@ async def delete_token(
     """Delete token"""
     try:
         await token_manager.delete_token(token_id)
+        if concurrency_manager:
+            await concurrency_manager.remove_token(token_id)
         return {"success": True, "message": "Token删除成功"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1015,6 +1151,45 @@ async def update_generation_config(
     return {"success": True, "message": "生成配置更新成功"}
 
 
+@router.get("/api/call-logic/config")
+async def get_call_logic_config(token: str = Depends(verify_admin_token)):
+    """Get token call logic configuration."""
+    config_obj = await db.get_call_logic_config()
+    call_mode = getattr(config_obj, "call_mode", None)
+    if call_mode not in ("default", "polling"):
+        call_mode = "polling" if getattr(config_obj, "polling_mode_enabled", False) else "default"
+    return {
+        "success": True,
+        "config": {
+            "call_mode": call_mode,
+            "polling_mode_enabled": call_mode == "polling",
+        }
+    }
+
+
+@router.post("/api/call-logic/config")
+async def update_call_logic_config(
+    request: CallLogicConfigRequest,
+    token: str = Depends(verify_admin_token)
+):
+    """Update token call logic configuration."""
+    call_mode = request.call_mode if request.call_mode in ("default", "polling") else None
+    if call_mode is None:
+        raise HTTPException(status_code=400, detail="Invalid call_mode")
+
+    await db.update_call_logic_config(call_mode)
+    await db.reload_config_to_memory()
+
+    return {
+        "success": True,
+        "message": "Token轮询模式保存成功",
+        "config": {
+            "call_mode": call_mode,
+            "polling_mode_enabled": call_mode == "polling",
+        }
+    }
+
+
 # ========== System Info ==========
 
 @router.get("/api/system/info")
@@ -1047,6 +1222,17 @@ async def logout(token: str = Depends(verify_admin_token)):
     return await admin_logout(token)
 
 
+@router.get("/health")
+async def health_check():
+    """Public health check endpoint - no auth required"""
+    try:
+        stats = await db.get_dashboard_stats()
+        has_active_tokens = stats.get("active_tokens", 0) > 0
+    except Exception:
+        return {"backend_running": True, "has_active_tokens": False}
+    return {"backend_running": True, "has_active_tokens": has_active_tokens}
+
+
 @router.get("/api/stats")
 async def get_stats(token: str = Depends(verify_admin_token)):
     """Get statistics for dashboard"""
@@ -1062,19 +1248,28 @@ async def get_logs(
     limit = max(1, min(limit, 100))
     logs = await db.get_logs(limit=limit, include_payload=False)
 
-    return [{
-        "id": log.get("id"),
-        "token_id": log.get("token_id"),
-        "token_email": log.get("token_email"),
-        "token_username": log.get("token_username"),
-        "operation": log.get("operation"),
-        "status_code": log.get("status_code"),
-        "duration": log.get("duration"),
-        "status_text": log.get("status_text") or "",
-        "progress": log.get("progress") or 0,
-        "created_at": log.get("created_at"),
-        "updated_at": log.get("updated_at")
-    } for log in logs]
+    result = []
+    for log in logs:
+        raw_status_code = log.get("status_code")
+        try:
+            status_code = int(raw_status_code) if raw_status_code is not None else None
+        except (TypeError, ValueError):
+            status_code = None
+        result.append({
+            "id": log.get("id"),
+            "token_id": log.get("token_id"),
+            "token_email": log.get("token_email"),
+            "token_username": log.get("token_username"),
+            "operation": log.get("operation"),
+            "status_code": status_code if status_code is not None else raw_status_code,
+            "duration": log.get("duration"),
+            "status_text": log.get("status_text") or "",
+            "progress": log.get("progress") or 0,
+            "created_at": log.get("created_at"),
+            "updated_at": log.get("updated_at"),
+            "error_summary": _extract_error_summary(log.get("response_body_excerpt")) if status_code is not None and status_code >= 400 else "",
+        })
+    return result
 
 
 @router.get("/api/logs/{log_id}")
@@ -1086,6 +1281,8 @@ async def get_log_detail(
     log = await db.get_log_detail(log_id)
     if not log:
         raise HTTPException(status_code=404, detail="日志不存在")
+
+    error_summary = _extract_error_summary(log.get("response_body"))
 
     return {
         "id": log.get("id"),
@@ -1099,6 +1296,7 @@ async def get_log_detail(
         "progress": log.get("progress") or 0,
         "created_at": log.get("created_at"),
         "updated_at": log.get("updated_at"),
+        "error_summary": error_summary,
         "request_body": log.get("request_body"),
         "response_body": log.get("response_body")
     }
@@ -1224,10 +1422,12 @@ async def update_token_refresh_enabled(
     }
 
 
-def _sync_runtime_cache_config():
+async def _sync_runtime_cache_config():
     from . import routes
     if routes.generation_handler and routes.generation_handler.file_cache:
-        routes.generation_handler.file_cache.set_timeout(config.cache_timeout)
+        file_cache = routes.generation_handler.file_cache
+        file_cache.set_timeout(config.cache_timeout)
+        await file_cache.refresh_cleanup_task()
 
 # ========== Cache Configuration Endpoints ==========
 
@@ -1261,7 +1461,7 @@ async def update_cache_enabled(
 
     # 🔥 Hot reload: sync database config to memory
     await db.reload_config_to_memory()
-    _sync_runtime_cache_config()
+    await _sync_runtime_cache_config()
 
     return {"success": True, "message": f"缓存已{'启用' if enabled else '禁用'}"}
 
@@ -1288,7 +1488,7 @@ async def update_cache_config_full(
 
     # 🔥 Hot reload: sync database config to memory
     await db.reload_config_to_memory()
-    _sync_runtime_cache_config()
+    await _sync_runtime_cache_config()
 
     return {"success": True, "message": "缓存配置更新成功"}
 
@@ -1304,7 +1504,7 @@ async def update_cache_base_url(
 
     # 🔥 Hot reload: sync database config to memory
     await db.reload_config_to_memory()
-    _sync_runtime_cache_config()
+    await _sync_runtime_cache_config()
 
     return {"success": True, "message": "缓存Base URL更新成功"}
 
@@ -1333,6 +1533,9 @@ async def update_captcha_config(
     browser_proxy_enabled = request.get("browser_proxy_enabled", False)
     browser_proxy_url = request.get("browser_proxy_url", "")
     browser_count = request.get("browser_count", 1)
+    personal_project_pool_size = request.get("personal_project_pool_size")
+    personal_max_resident_tabs = request.get("personal_max_resident_tabs")
+    personal_idle_tab_ttl_seconds = request.get("personal_idle_tab_ttl_seconds")
 
     # 验证浏览器代理URL格式
     if browser_proxy_enabled and browser_proxy_url:
@@ -1373,8 +1576,14 @@ async def update_captcha_config(
         remote_browser_timeout=remote_browser_timeout,
         browser_proxy_enabled=browser_proxy_enabled,
         browser_proxy_url=browser_proxy_url if browser_proxy_enabled else None,
-        browser_count=max(1, int(browser_count)) if browser_count else 1
+        browser_count=max(1, int(browser_count)) if browser_count else 1,
+        personal_project_pool_size=personal_project_pool_size,
+        personal_max_resident_tabs=personal_max_resident_tabs,
+        personal_idle_tab_ttl_seconds=personal_idle_tab_ttl_seconds
     )
+
+    # 🔥 Hot reload: sync database config to memory
+    await db.reload_config_to_memory()
 
     # 如果使用 browser 打码，热重载浏览器数量配置
     if captcha_method == "browser":
@@ -1385,8 +1594,14 @@ async def update_captcha_config(
         except Exception:
             pass
 
-    # 🔥 Hot reload: sync database config to memory
-    await db.reload_config_to_memory()
+    # 如果使用 personal 打码，热重载配置
+    if captcha_method == "personal":
+        try:
+            from ..services.browser_captcha_personal import BrowserCaptchaService
+            service = await BrowserCaptchaService.get_instance(db)
+            await service.reload_config()
+        except Exception as e:
+            print(f"[Admin] Personal 配置热更新失败: {e}")
 
     return {"success": True, "message": "验证码配置更新成功"}
 
@@ -1411,310 +1626,20 @@ async def get_captcha_config(token: str = Depends(verify_admin_token)):
         "remote_browser_timeout": captcha_config.remote_browser_timeout,
         "browser_proxy_enabled": captcha_config.browser_proxy_enabled,
         "browser_proxy_url": captcha_config.browser_proxy_url or "",
-        "browser_count": captcha_config.browser_count
+        "browser_count": captcha_config.browser_count,
+        "personal_project_pool_size": captcha_config.personal_project_pool_size,
+        "personal_max_resident_tabs": captcha_config.personal_max_resident_tabs,
+        "personal_idle_tab_ttl_seconds": captcha_config.personal_idle_tab_ttl_seconds
     }
 
 
 @router.post("/api/captcha/score-test")
 async def test_captcha_score(
-    request: Optional[CaptchaScoreTestRequest] = None,
-    token: str = Depends(verify_admin_token)
+    _request: Optional[CaptchaScoreTestRequest] = None,
+    _token: str = Depends(verify_admin_token)
 ):
-    """使用当前打码方式获取 token，并提交到 antcpt 校验分数。"""
-    req = request or CaptchaScoreTestRequest()
-    website_url = (req.website_url or "https://antcpt.com/score_detector/").strip()
-    website_key = (req.website_key or "6LcR_okUAAAAAPYrPe-HK_0RULO1aZM15ENyM-Mf").strip()
-    action = (req.action or "homepage").strip()
-    verify_url = (req.verify_url or "https://antcpt.com/score_detector/verify.php").strip()
-    enterprise = bool(req.enterprise)
-
-    started_at = time.time()
-    captcha_config = await db.get_captcha_config()
-    captcha_method = (captcha_config.captcha_method or config.captcha_method or "").strip().lower()
-    browser_proxy_enabled = bool(captcha_config.browser_proxy_enabled)
-    browser_proxy_url = captcha_config.browser_proxy_url or ""
-
-    token_value: Optional[str] = None
-    fingerprint: Optional[Dict[str, Any]] = None
-    token_elapsed_ms = 0
-    verify_elapsed_ms = 0
-    verify_http_status = None
-    verify_result: Dict[str, Any] = {}
-    verify_headers: Dict[str, str] = {}
-    verify_proxy_used = False
-    verify_proxy_source = "none"
-    verify_proxy_url = ""
-    verify_impersonate = "chrome120"
-    page_verify_only = captcha_method in {"browser", "personal", "remote_browser"}
-    verify_mode = "browser_page" if page_verify_only else "server_post"
-
-    try:
-        token_start = time.time()
-        if captcha_method == "browser":
-            from ..services.browser_captcha import BrowserCaptchaService
-            service = await BrowserCaptchaService.get_instance(db)
-            score_payload, browser_id = await service.get_custom_score(
-                website_url=website_url,
-                website_key=website_key,
-                verify_url=verify_url,
-                action=action,
-                enterprise=enterprise
-            )
-            if isinstance(score_payload, dict):
-                token_value = score_payload.get("token")
-                verify_elapsed_ms = int(score_payload.get("verify_elapsed_ms") or 0)
-                verify_http_status = score_payload.get("verify_http_status")
-                verify_result = score_payload.get("verify_result") if isinstance(score_payload.get("verify_result"), dict) else {}
-                verify_mode = score_payload.get("verify_mode") or "browser_page"
-                score_token_elapsed = score_payload.get("token_elapsed_ms")
-                if isinstance(score_token_elapsed, (int, float)):
-                    token_elapsed_ms = int(score_token_elapsed)
-            if token_value:
-                fingerprint = await service.get_fingerprint(browser_id)
-                verify_proxy_used = bool(browser_proxy_enabled and browser_proxy_url)
-                verify_proxy_source = "captcha_browser_proxy" if verify_proxy_used else "browser_direct"
-                verify_proxy_url = browser_proxy_url if verify_proxy_used else ""
-        elif captcha_method == "personal":
-            from ..services.browser_captcha_personal import BrowserCaptchaService
-            service = await BrowserCaptchaService.get_instance(db)
-            score_payload = await service.get_custom_score(
-                website_url=website_url,
-                website_key=website_key,
-                verify_url=verify_url,
-                action=action,
-                enterprise=enterprise
-            )
-            if isinstance(score_payload, dict):
-                token_value = score_payload.get("token")
-                verify_elapsed_ms = int(score_payload.get("verify_elapsed_ms") or 0)
-                verify_http_status = score_payload.get("verify_http_status")
-                verify_result = score_payload.get("verify_result") if isinstance(score_payload.get("verify_result"), dict) else {}
-                verify_mode = score_payload.get("verify_mode") or "browser_page"
-                score_token_elapsed = score_payload.get("token_elapsed_ms")
-                if isinstance(score_token_elapsed, (int, float)):
-                    token_elapsed_ms = int(score_token_elapsed)
-            if token_value:
-                fingerprint = service.get_last_fingerprint()
-                verify_proxy_used = bool(browser_proxy_enabled and browser_proxy_url)
-                verify_proxy_source = "captcha_browser_proxy" if verify_proxy_used else "browser_direct"
-                verify_proxy_url = browser_proxy_url if verify_proxy_used else ""
-        elif captcha_method == "remote_browser":
-            score_payload = await _score_test_with_remote_browser_service(
-                website_url=website_url,
-                website_key=website_key,
-                verify_url=verify_url,
-                action=action,
-                enterprise=enterprise,
-            )
-            if isinstance(score_payload, dict):
-                if score_payload.get("success") is False:
-                    raise RuntimeError(score_payload.get("message") or "远程打码分数测试失败")
-                token_value = score_payload.get("token")
-                verify_elapsed_ms = int(score_payload.get("verify_elapsed_ms") or 0)
-                verify_http_status = score_payload.get("verify_http_status")
-                verify_result = score_payload.get("verify_result") if isinstance(score_payload.get("verify_result"), dict) else {}
-                verify_mode = score_payload.get("verify_mode") or "remote_browser_page"
-                score_token_elapsed = score_payload.get("token_elapsed_ms")
-                if isinstance(score_token_elapsed, (int, float)):
-                    token_elapsed_ms = int(score_token_elapsed)
-                fingerprint = score_payload.get("fingerprint") if isinstance(score_payload.get("fingerprint"), dict) else None
-        elif captcha_method in SUPPORTED_API_CAPTCHA_METHODS:
-            token_value = await _solve_recaptcha_with_api_service(
-                method=captcha_method,
-                website_url=website_url,
-                website_key=website_key,
-                action=action,
-                enterprise=enterprise
-            )
-        else:
-            return {
-                "success": False,
-                "message": f"当前打码方式不支持分数测试: {captcha_method}",
-                "captcha_method": captcha_method,
-                "website_url": website_url,
-                "website_key": website_key,
-                "action": action,
-                "verify_url": verify_url,
-                "enterprise": enterprise,
-                "token_acquired": False,
-                "elapsed_ms": int((time.time() - started_at) * 1000)
-            }
-        if token_elapsed_ms <= 0:
-            token_elapsed_ms = int((time.time() - token_start) * 1000)
-
-        # 远程有头打码的 custom-score 可能由页面内直接完成校验，
-        # 在部分实现里不会显式回传 token，本地按 verify_result 兜底判定。
-        if captcha_method == "remote_browser" and not token_value and isinstance(verify_result, dict):
-            if verify_result.get("success") is True:
-                token_value = verify_result.get("token") or verify_result.get("gRecaptchaResponse") or "__verified_by_remote__"
-
-        if not token_value:
-            return {
-                "success": False,
-                "message": "未获取到 reCAPTCHA token",
-                "captcha_method": captcha_method,
-                "website_url": website_url,
-                "website_key": website_key,
-                "action": action,
-                "verify_url": verify_url,
-                "enterprise": enterprise,
-                "token_acquired": False,
-                "token_elapsed_ms": token_elapsed_ms,
-                "browser_proxy_enabled": browser_proxy_enabled,
-                "browser_proxy_url": browser_proxy_url if browser_proxy_enabled else "",
-                "fingerprint": fingerprint,
-                "elapsed_ms": int((time.time() - started_at) * 1000)
-            }
-
-        if verify_mode == "server_post" and not page_verify_only:
-            verify_start = time.time()
-            verify_headers = {
-                "accept": "application/json, text/javascript, */*; q=0.01",
-                "content-type": "application/json",
-                "origin": "https://antcpt.com",
-                "referer": website_url,
-                "x-requested-with": "XMLHttpRequest",
-            }
-            if isinstance(fingerprint, dict):
-                ua = (fingerprint.get("user_agent") or "").strip()
-                lang = (fingerprint.get("accept_language") or "").strip()
-                sec_ch_ua = (fingerprint.get("sec_ch_ua") or "").strip()
-                sec_ch_ua_mobile = (fingerprint.get("sec_ch_ua_mobile") or "").strip()
-                sec_ch_ua_platform = (fingerprint.get("sec_ch_ua_platform") or "").strip()
-
-                if ua:
-                    verify_headers["user-agent"] = ua
-                if lang:
-                    verify_headers["accept-language"] = lang if "," in lang else f"{lang},zh;q=0.9"
-                if sec_ch_ua:
-                    verify_headers["sec-ch-ua"] = sec_ch_ua
-                if sec_ch_ua_mobile:
-                    verify_headers["sec-ch-ua-mobile"] = sec_ch_ua_mobile
-                if sec_ch_ua_platform:
-                    verify_headers["sec-ch-ua-platform"] = sec_ch_ua_platform
-
-            if verify_headers.get("user-agent"):
-                for header_name, header_value in _guess_client_hints_from_user_agent(
-                    verify_headers.get("user-agent", "")
-                ).items():
-                    if header_value and not verify_headers.get(header_name):
-                        verify_headers[header_name] = header_value
-                verify_impersonate = _guess_impersonate_from_user_agent(verify_headers.get("user-agent", ""))
-
-            verify_proxies, verify_proxy_used, verify_proxy_source, verify_proxy_url = (
-                await _resolve_score_test_verify_proxy(
-                    captcha_method=captcha_method,
-                    browser_proxy_enabled=browser_proxy_enabled,
-                    browser_proxy_url=browser_proxy_url
-                )
-            )
-
-            async with AsyncSession() as session:
-                verify_resp = await session.post(
-                    verify_url,
-                    json={"g-recaptcha-response": token_value},
-                    headers=verify_headers,
-                    proxies=verify_proxies,
-                    impersonate=verify_impersonate,
-                    timeout=30
-                )
-            verify_elapsed_ms = int((time.time() - verify_start) * 1000)
-            verify_http_status = verify_resp.status_code
-
-            try:
-                verify_result = verify_resp.json()
-            except Exception:
-                verify_result = {"raw": verify_resp.text}
-        else:
-            verify_headers = {
-                "origin": "https://antcpt.com",
-                "referer": website_url,
-                "x-requested-with": "XMLHttpRequest",
-            }
-            if isinstance(fingerprint, dict):
-                verify_headers.update({
-                    "user-agent": fingerprint.get("user_agent", ""),
-                    "accept-language": fingerprint.get("accept_language", ""),
-                    "sec-ch-ua": fingerprint.get("sec_ch_ua", ""),
-                    "sec-ch-ua-mobile": fingerprint.get("sec_ch_ua_mobile", ""),
-                    "sec-ch-ua-platform": fingerprint.get("sec_ch_ua_platform", ""),
-                })
-
-        verify_success = bool(verify_result.get("success")) if isinstance(verify_result, dict) else False
-        score_value = verify_result.get("score") if isinstance(verify_result, dict) else None
-
-        return {
-            "success": verify_success,
-            "message": "分数校验成功" if verify_success else "分数校验未通过",
-            "captcha_method": captcha_method,
-            "website_url": website_url,
-            "website_key": website_key,
-            "action": action,
-            "verify_url": verify_url,
-            "enterprise": enterprise,
-            "token_acquired": True,
-            "token_preview": _mask_token(token_value),
-            "token_elapsed_ms": token_elapsed_ms,
-            "verify_elapsed_ms": verify_elapsed_ms,
-            "verify_http_status": verify_http_status,
-            "score": score_value,
-            "verify_result": verify_result,
-            "verify_request_meta": {
-                "mode": verify_mode,
-                "proxy_used": verify_proxy_used,
-                "user_agent": verify_headers.get("user-agent", ""),
-                "accept_language": verify_headers.get("accept-language", ""),
-                "sec_ch_ua": verify_headers.get("sec-ch-ua", ""),
-                "sec_ch_ua_mobile": verify_headers.get("sec-ch-ua-mobile", ""),
-                "sec_ch_ua_platform": verify_headers.get("sec-ch-ua-platform", ""),
-                "origin": verify_headers.get("origin", ""),
-                "referer": verify_headers.get("referer", ""),
-                "x_requested_with": verify_headers.get("x-requested-with", ""),
-                "proxy_source": verify_proxy_source,
-                "proxy_url": verify_proxy_url,
-                "impersonate": verify_impersonate,
-            },
-            "browser_proxy_enabled": browser_proxy_enabled,
-            "browser_proxy_url": browser_proxy_url if browser_proxy_enabled else "",
-            "fingerprint": fingerprint,
-            "elapsed_ms": int((time.time() - started_at) * 1000)
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "message": f"分数测试失败: {str(e)}",
-            "captcha_method": captcha_method,
-            "website_url": website_url,
-            "website_key": website_key,
-            "action": action,
-            "verify_url": verify_url,
-            "enterprise": enterprise,
-            "token_acquired": bool(token_value),
-            "token_preview": _mask_token(token_value),
-            "token_elapsed_ms": token_elapsed_ms,
-            "verify_elapsed_ms": verify_elapsed_ms,
-            "verify_http_status": verify_http_status,
-            "verify_result": verify_result,
-            "verify_request_meta": {
-                "mode": verify_mode,
-                "proxy_used": verify_proxy_used,
-                "user_agent": verify_headers.get("user-agent", ""),
-                "accept_language": verify_headers.get("accept-language", ""),
-                "sec_ch_ua": verify_headers.get("sec-ch-ua", ""),
-                "sec_ch_ua_mobile": verify_headers.get("sec-ch-ua-mobile", ""),
-                "sec_ch_ua_platform": verify_headers.get("sec-ch-ua-platform", ""),
-                "origin": verify_headers.get("origin", ""),
-                "referer": verify_headers.get("referer", ""),
-                "x_requested_with": verify_headers.get("x-requested-with", ""),
-                "proxy_source": verify_proxy_source,
-                "proxy_url": verify_proxy_url,
-                "impersonate": verify_impersonate,
-            },
-            "browser_proxy_enabled": browser_proxy_enabled,
-            "browser_proxy_url": browser_proxy_url if browser_proxy_enabled else "",
-            "fingerprint": fingerprint,
-            "elapsed_ms": int((time.time() - started_at) * 1000)
-        }
+    """分数测试已禁用。"""
+    raise HTTPException(status_code=403, detail="已禁用分数测试")
 
 
 # ========== Plugin Configuration Endpoints ==========

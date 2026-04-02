@@ -3,6 +3,7 @@ import asyncio
 import random
 from typing import Optional, Dict
 from ..core.models import Token
+from ..core.config import config
 from ..core.account_tiers import (
     get_paygate_tier_label,
     get_required_paygate_tier_for_model,
@@ -22,6 +23,8 @@ class LoadBalancer:
         self._image_pending: Dict[int, int] = {}
         self._video_pending: Dict[int, int] = {}
         self._pending_lock = asyncio.Lock()
+        self._round_robin_state: Dict[str, Optional[int]] = {"image": None, "video": None, "default": None}
+        self._rr_lock = asyncio.Lock()
 
     async def _get_pending_count(self, token_id: int, for_image_generation: bool, for_video_generation: bool) -> int:
         async with self._pending_lock:
@@ -95,6 +98,24 @@ class LoadBalancer:
             return await self.concurrency_manager.acquire_video(token_id)
 
         return True
+
+    async def _select_round_robin(self, tokens: list[dict], scenario: str) -> Optional[dict]:
+        """Select candidate in round-robin order for the given scenario."""
+        if not tokens:
+            return None
+
+        tokens_sorted = sorted(tokens, key=lambda item: item["token"].id or 0)
+        async with self._rr_lock:
+            last_id = self._round_robin_state.get(scenario)
+            start_idx = 0
+            if last_id is not None:
+                for idx, item in enumerate(tokens_sorted):
+                    if item["token"].id == last_id:
+                        start_idx = (idx + 1) % len(tokens_sorted)
+                        break
+            selected = tokens_sorted[start_idx]
+            self._round_robin_state[scenario] = selected["token"].id
+        return selected
 
     async def select_token(
         self,
@@ -180,6 +201,7 @@ class LoadBalancer:
                 "token": token,
                 "inflight": inflight,
                 "remaining": remaining,
+                "needs_refresh": self.token_manager.needs_at_refresh(token),
                 "random": random.random()
             })
 
@@ -193,14 +215,38 @@ class LoadBalancer:
             return None
 
         # 最低 in-flight 优先；有并发上限时，剩余槽位更多的 token 优先；最后随机打散
-        available_tokens.sort(
-            key=lambda item: (
-                item["inflight"],
-                0 if item["remaining"] is None else 1,
-                -(item["remaining"] or 0),
-                item["random"]
+        call_mode = config.call_logic_mode
+        if call_mode == "polling":
+            scenario = "default"
+            if for_image_generation:
+                scenario = "image"
+            elif for_video_generation:
+                scenario = "video"
+
+            ordered_candidates = []
+            first_candidate = await self._select_round_robin(available_tokens, scenario)
+            if first_candidate is not None:
+                ordered_candidates.append(first_candidate)
+                ordered_candidates.extend(
+                    item for item in sorted(available_tokens, key=lambda item: item["token"].id or 0)
+                    if item["token"].id != first_candidate["token"].id
+                )
+            available_tokens = ordered_candidates
+        else:
+            available_tokens.sort(
+                key=lambda item: (
+                    1 if item["needs_refresh"] else 0,
+                    item["inflight"],
+                    0 if item["remaining"] is None else 1,
+                    -(item["remaining"] or 0),
+                    item["random"]
+                )
             )
-        )
+
+        ready_candidates = [item for item in available_tokens if not item["needs_refresh"]]
+        refresh_candidates = [item for item in available_tokens if item["needs_refresh"]]
+        if ready_candidates and refresh_candidates:
+            available_tokens = ready_candidates + refresh_candidates
 
         debug_logger.log_info("[LOAD_BALANCER] 候选Token负载:")
         for item in available_tokens:
@@ -208,7 +254,8 @@ class LoadBalancer:
             remaining = "unlimited" if item["remaining"] is None else item["remaining"]
             debug_logger.log_info(
                 f"[LOAD_BALANCER]   - Token {token.id} ({token.email}) "
-                f"inflight={item['inflight']}, remaining={remaining}, credits={token.credits}"
+                f"inflight={item['inflight']}, remaining={remaining}, "
+                f"needs_refresh={item['needs_refresh']}, credits={token.credits}"
             )
 
         # 只为候选列表中真正尝试到的 token 做 AT 校验，避免每次请求把所有 token 全扫一遍
@@ -225,6 +272,9 @@ class LoadBalancer:
                 debug_logger.log_info(f"[LOAD_BALANCER] 跳过 Token {token.id}: 预占槽位失败")
                 continue
 
+            if track_pending:
+                await self._add_pending(token.id, for_image_generation, for_video_generation)
+
             debug_logger.log_info(
                 f"[LOAD_BALANCER] ✅ 已选择Token {token.id} ({token.email}) - "
                 f"余额: {token.credits}, inflight={item['inflight']}"
@@ -232,4 +282,44 @@ class LoadBalancer:
             return token
 
         debug_logger.log_info(f"[LOAD_BALANCER] ❌ 候选Token均不可用 (图片生成={for_image_generation}, 视频生成={for_video_generation})")
+        return None
+
+    async def get_unavailable_reason(
+        self,
+        *,
+        for_image_generation: bool = False,
+        for_video_generation: bool = False,
+        model: Optional[str] = None,
+    ) -> Optional[str]:
+        """给出更明确的“无可用账号”原因，优先用于分辨率/tier 档位提示。"""
+        active_tokens = await self.token_manager.get_active_tokens()
+        if not active_tokens:
+            return None
+
+        required_tier = get_required_paygate_tier_for_model(model)
+        supported_tokens = []
+        for token in active_tokens:
+            normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
+            if model and not supports_model_for_tier(model, normalized_tier):
+                continue
+            supported_tokens.append(token)
+
+        if model and not supported_tokens:
+            tier_label = get_paygate_tier_label(required_tier)
+            return f"当前模型需要 {tier_label} 账号，但没有可用的 {tier_label} 账号: {model}"
+
+        capability_tokens = []
+        for token in supported_tokens:
+            if for_image_generation and not token.image_enabled:
+                continue
+            if for_video_generation and not token.video_enabled:
+                continue
+            capability_tokens.append(token)
+
+        if supported_tokens and not capability_tokens:
+            if for_image_generation:
+                return "当前有符合档位的账号，但图片生成功能已全部禁用。"
+            if for_video_generation:
+                return "当前有符合档位的账号，但视频生成功能已全部禁用。"
+
         return None

@@ -1,11 +1,13 @@
 """Data models for Flow2API"""
-from pydantic import BaseModel
-from typing import Optional, List, Union, Any
+
+from pydantic import BaseModel, ConfigDict
+from typing import Optional, List, Union, Any, Literal
 from datetime import datetime
 
 
 class Token(BaseModel):
     """Token model for Flow2API"""
+
     id: Optional[int] = None
 
     # 认证信息 (核心)
@@ -48,6 +50,7 @@ class Token(BaseModel):
 
 class Project(BaseModel):
     """Project model for VideoFX"""
+
     id: Optional[int] = None
     project_id: str  # VideoFX项目UUID
     token_id: int  # 关联的Token ID
@@ -59,6 +62,7 @@ class Project(BaseModel):
 
 class TokenStats(BaseModel):
     """Token statistics"""
+
     token_id: int
     image_count: int = 0
     video_count: int = 0
@@ -77,6 +81,7 @@ class TokenStats(BaseModel):
 
 class Task(BaseModel):
     """Generation task"""
+
     id: Optional[int] = None
     task_id: str  # Flow API返回的operation name
     token_id: int
@@ -93,6 +98,7 @@ class Task(BaseModel):
 
 class RequestLog(BaseModel):
     """API request log"""
+
     id: Optional[int] = None
     token_id: Optional[int] = None
     operation: str
@@ -108,6 +114,7 @@ class RequestLog(BaseModel):
 
 class AdminConfig(BaseModel):
     """Admin configuration"""
+
     id: int = 1
     username: str
     password: str
@@ -117,6 +124,7 @@ class AdminConfig(BaseModel):
 
 class ProxyConfig(BaseModel):
     """Proxy configuration"""
+
     id: int = 1
     enabled: bool = False  # 请求代理开关
     proxy_url: Optional[str] = None  # 请求代理地址
@@ -126,13 +134,24 @@ class ProxyConfig(BaseModel):
 
 class GenerationConfig(BaseModel):
     """Generation timeout configuration"""
+
     id: int = 1
     image_timeout: int = 300  # seconds
     video_timeout: int = 1500  # seconds
 
 
+class CallLogicConfig(BaseModel):
+    """Token selection call logic configuration"""
+
+    id: int = 1
+    call_mode: str = "default"
+    polling_mode_enabled: bool = False
+    updated_at: Optional[datetime] = None
+
+
 class CacheConfig(BaseModel):
     """Cache configuration"""
+
     id: int = 1
     cache_enabled: bool = False
     cache_timeout: int = 7200  # seconds (2 hours), 0 means never expire
@@ -143,6 +162,7 @@ class CacheConfig(BaseModel):
 
 class DebugConfig(BaseModel):
     """Debug configuration"""
+
     id: int = 1
     enabled: bool = False
     log_requests: bool = True
@@ -154,6 +174,7 @@ class DebugConfig(BaseModel):
 
 class CaptchaConfig(BaseModel):
     """Captcha configuration"""
+
     id: int = 1
     captcha_method: str = "browser"  # yescaptcha/capmonster/ezcaptcha/capsolver/browser/personal/remote_browser
     browser_driver: str = "nodriver"  # personal 模式的浏览器驱动: nodriver 或 drission
@@ -173,12 +194,16 @@ class CaptchaConfig(BaseModel):
     browser_proxy_enabled: bool = False  # 浏览器打码是否启用代理
     browser_proxy_url: Optional[str] = None  # 浏览器打码代理URL
     browser_count: int = 1  # 浏览器打码实例数量
+    personal_project_pool_size: int = 4  # 单个 Token 默认维护的项目池数量（仅影响项目轮换）
+    personal_max_resident_tabs: int = 5  # 内置浏览器共享打码标签页数量上限
+    personal_idle_tab_ttl_seconds: int = 600  # 内置浏览器标签页空闲超时(秒)
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
 
 class PluginConfig(BaseModel):
     """Plugin connection configuration"""
+
     id: int = 1
     connection_token: str = ""  # 插件连接token
     auto_enable_on_update: bool = True  # 更新token时自动启用（默认开启）
@@ -189,17 +214,84 @@ class PluginConfig(BaseModel):
 # OpenAI Compatible Request Models
 class ChatMessage(BaseModel):
     """Chat message"""
+
     role: str
     content: Union[str, List[dict]]  # string or multimodal array
 
 
+class ImageConfig(BaseModel):
+    """Gemini imageConfig parameters"""
+
+    aspectRatio: Optional[str] = None  # "16:9", "9:16", "1:1", "4:3", "3:4"
+    imageSize: Optional[str] = None  # "2k", "4k"
+
+    # 兼容 OpenAI/NewAPI 等上游可能透传的 size/quality 或 snake_case 字段
+    model_config = ConfigDict(extra="allow")
+
+
+class GenerationConfigParam(BaseModel):
+    """Gemini generationConfig parameters (for model name resolution)"""
+
+    responseModalities: Optional[List[str]] = None  # ["IMAGE", "TEXT"]
+    imageConfig: Optional[ImageConfig] = None
+
+    model_config = ConfigDict(extra="allow")
+
+
+class GeminiInlineData(BaseModel):
+    """Gemini inline binary data."""
+
+    mimeType: str
+    data: str
+
+
+class GeminiFileData(BaseModel):
+    """Gemini file reference."""
+
+    fileUri: str
+    mimeType: Optional[str] = None
+
+
+class GeminiPart(BaseModel):
+    """Gemini content part."""
+
+    text: Optional[str] = None
+    inlineData: Optional[GeminiInlineData] = None
+    fileData: Optional[GeminiFileData] = None
+
+    model_config = ConfigDict(extra="allow")
+
+
+class GeminiContent(BaseModel):
+    """Gemini content block."""
+
+    role: Optional[Literal["user", "model"]] = None
+    parts: List[GeminiPart]
+
+
+class GeminiGenerateContentRequest(BaseModel):
+    """Gemini official generateContent request."""
+
+    contents: List[GeminiContent]
+    generationConfig: Optional[GenerationConfigParam] = None
+    systemInstruction: Optional[GeminiContent] = None
+
+    model_config = ConfigDict(extra="allow")
+
+
 class ChatCompletionRequest(BaseModel):
-    """Chat completion request (OpenAI compatible)"""
+    """Chat completion request (OpenAI compatible + Gemini extension)"""
+
     model: str
-    messages: List[ChatMessage]
+    messages: Optional[List[ChatMessage]] = None
     stream: bool = False
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     # Flow2API specific parameters
     image: Optional[str] = None  # Base64 encoded image (deprecated, use messages)
     video: Optional[str] = None  # Base64 encoded video (deprecated)
+    # Gemini extension parameters (from extra_body or top-level)
+    generationConfig: Optional[GenerationConfigParam] = None
+    contents: Optional[List[Any]] = None  # Gemini native contents
+
+    model_config = ConfigDict(extra="allow")  # Allow extra fields like extra_body passthrough

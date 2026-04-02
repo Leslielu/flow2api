@@ -3,6 +3,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 from ..core.database import Database
+from ..core.config import config
 from ..core.models import Token, Project
 from ..core.logger import debug_logger
 from .flow_client import FlowClient
@@ -15,10 +16,32 @@ class TokenManager:
     def __init__(self, db: Database, flow_client: FlowClient):
         self.db = db
         self.flow_client = flow_client
-        self._lock = asyncio.Lock()
-        self._project_lock = asyncio.Lock()
+        self._refresh_lock_guard = asyncio.Lock()
+        self._project_lock_guard = asyncio.Lock()
+        self._refresh_locks: dict[int, asyncio.Lock] = {}
+        self._project_locks: dict[int, asyncio.Lock] = {}
         self._refresh_futures: dict[int, asyncio.Task] = {}
-        self._project_pool_size = 4
+
+    async def _get_token_lock(
+        self,
+        lock_map: dict[int, asyncio.Lock],
+        guard: asyncio.Lock,
+        token_id: int,
+    ) -> asyncio.Lock:
+        """按 token 维度获取锁，避免不同 token 之间串行阻塞。"""
+        async with guard:
+            lock = lock_map.get(token_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                lock_map[token_id] = lock
+            return lock
+
+    def _get_project_pool_size(self) -> int:
+        """读取当前生效的单 Token 项目池大小配置。"""
+        try:
+            return max(1, min(50, int(config.personal_project_pool_size or 4)))
+        except Exception:
+            return 4
 
     def _sort_projects(self, projects: List[Project]) -> List[Project]:
         """Sort projects in a stable order for round-robin selection."""
@@ -38,6 +61,47 @@ class TokenManager:
         """Build a project name for the pool."""
         normalized_base = self._normalize_project_name_base(base_name)
         return f"{normalized_base} P{pool_index}"
+
+    async def get_personal_warmup_project_ids(
+        self,
+        tokens: Optional[List[Token]] = None,
+        limit: Optional[int] = None,
+    ) -> List[str]:
+        """返回 personal 模式启动时建议预热的项目 ID 列表。"""
+        token_list = tokens if tokens is not None else await self.get_all_tokens()
+        pool_size = self._get_project_pool_size()
+        warmup_ids: List[str] = []
+        seen_projects: set[str] = set()
+
+        try:
+            warmup_limit = None if limit is None else max(1, int(limit))
+        except Exception:
+            warmup_limit = None
+
+        for token in token_list:
+            if not token or not token.is_active:
+                continue
+
+            candidate_ids: List[str] = []
+            current_project_id = str(token.current_project_id or "").strip()
+            if current_project_id:
+                candidate_ids.append(current_project_id)
+
+            projects = [project for project in await self.db.get_projects_by_token(token.id) if project.is_active]
+            for project in self._sort_projects(projects):
+                project_id = str(project.project_id or "").strip()
+                if project_id and project_id not in candidate_ids:
+                    candidate_ids.append(project_id)
+
+            for project_id in candidate_ids[:pool_size]:
+                if project_id in seen_projects:
+                    continue
+                seen_projects.add(project_id)
+                warmup_ids.append(project_id)
+                if warmup_limit is not None and len(warmup_ids) >= warmup_limit:
+                    return warmup_ids
+
+        return warmup_ids
 
     async def _create_project_for_token(self, token: Token, pool_index: int, base_name: Optional[str] = None) -> Project:
         """Create a new pooled project for a token and persist it."""
@@ -59,6 +123,9 @@ class TokenManager:
         ordered_projects = self._sort_projects(projects)
         if not ordered_projects:
             raise ValueError("No available projects for token")
+
+        if len(ordered_projects) == 1:
+            return ordered_projects[0]
 
         if token.current_project_id:
             for index, project in enumerate(ordered_projects):
@@ -83,7 +150,40 @@ class TokenManager:
 
     async def delete_token(self, token_id: int):
         """Delete token"""
+        token = await self.db.get_token(token_id)
+        project_ids: List[str] = []
+        if token:
+            current_project_id = str(token.current_project_id or "").strip()
+            if current_project_id:
+                project_ids.append(current_project_id)
+
+        for project in await self.db.get_projects_by_token(token_id):
+            project_id = str(project.project_id or "").strip()
+            if project_id and project_id not in project_ids:
+                project_ids.append(project_id)
+
         await self.db.delete_token(token_id)
+
+        refresh_task = self._refresh_futures.pop(token_id, None)
+        if refresh_task and not refresh_task.done():
+            refresh_task.cancel()
+            try:
+                await refresh_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        self._refresh_locks.pop(token_id, None)
+        self._project_locks.pop(token_id, None)
+
+        if config.captcha_method == "personal" and project_ids:
+            try:
+                from .browser_captcha_personal import BrowserCaptchaService
+                service = await BrowserCaptchaService.get_instance(self.db)
+                for project_id in project_ids:
+                    await service.stop_resident_mode(project_id)
+            except Exception as e:
+                debug_logger.log_warning(f"[DELETE_TOKEN] 清理 personal 浏览器状态失败: {e}")
 
     async def enable_token(self, token_id: int):
         """Enable a token and reset error count"""
@@ -141,6 +241,7 @@ class TokenManager:
             user_paygate_tier = None
 
         base_project_name = self._normalize_project_name_base(project_name)
+        project_pool_size = self._get_project_pool_size()
         pooled_projects: List[Project] = []
 
         if project_id:
@@ -191,7 +292,7 @@ class TokenManager:
         pooled_projects[0].token_id = token_id
         pooled_projects[0].id = await self.db.add_project(pooled_projects[0])
 
-        while len(pooled_projects) < self._project_pool_size:
+        while len(pooled_projects) < project_pool_size:
             new_project = await self._create_project_for_token(token, len(pooled_projects) + 1, base_project_name)
             pooled_projects.append(new_project)
 
@@ -293,6 +394,12 @@ class TokenManager:
 
         return False
 
+    def needs_at_refresh(self, token: Optional[Token]) -> bool:
+        """供调度层快速判断当前 token 是否大概率会触发 AT 刷新。"""
+        if not token:
+            return True
+        return self._should_refresh_at(token)
+
     async def ensure_valid_token(self, token: Optional[Token]) -> Optional[Token]:
         """确保 token 的 AT 可用，并在必要时返回刷新后的最新对象。"""
         if not token:
@@ -323,7 +430,12 @@ class TokenManager:
 
     async def _refresh_at_inner(self, token_id: int) -> bool:
         """Perform exactly one real AT refresh attempt."""
-        async with self._lock:
+        refresh_lock = await self._get_token_lock(
+            self._refresh_locks,
+            self._refresh_lock_guard,
+            token_id,
+        )
+        async with refresh_lock:
             token = await self.db.get_token(token_id)
             if not token:
                 return False
@@ -403,7 +515,8 @@ class TokenManager:
                 credits_result = await self.flow_client.get_credits(new_at)
                 await self.db.update_token(
                     token_id,
-                    credits=credits_result.get("credits", 0)
+                    credits=credits_result.get("credits", 0),
+                    user_paygate_tier=credits_result.get("userPaygateTier"),
                 )
                 debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: AT 验证成功（余额: {credits_result.get('credits', 0)}）")
                 return True
@@ -451,14 +564,23 @@ class TokenManager:
             # 根据 browser_driver 配置选择正确的服务
             browser_driver = getattr(config, 'browser_driver_attr', 'nodriver')
 
+            refresh_timeout_seconds = 45.0
             if browser_driver == "drission":
                 from .browser_captcha_drission import DrissionCaptchaService
                 service = await DrissionCaptchaService.get_instance(self.db)
-                new_st = await service.refresh_session_token(token.current_project_id)
             else:
                 from .browser_captcha_personal import BrowserCaptchaService
                 service = await BrowserCaptchaService.get_instance(self.db)
-                new_st = await service.refresh_session_token(token.current_project_id)
+            try:
+                new_st = await asyncio.wait_for(
+                    service.refresh_session_token(token.current_project_id),
+                    timeout=refresh_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                debug_logger.log_error(
+                    f"[ST_REFRESH] Token {token_id}: 刷新 ST 超时 ({refresh_timeout_seconds:.0f}s)"
+                )
+                return None
             if new_st and new_st != token.st:
                 # 更新数据库中的 ST
                 await self.db.update_token(token_id, st=new_st)
@@ -477,7 +599,12 @@ class TokenManager:
 
     async def ensure_project_exists(self, token_id: int) -> str:
         """Ensure a token has a pooled set of projects and return one in round-robin order."""
-        async with self._project_lock:
+        project_lock = await self._get_token_lock(
+            self._project_locks,
+            self._project_lock_guard,
+            token_id,
+        )
+        async with project_lock:
             token = await self.db.get_token(token_id)
             if not token:
                 raise ValueError("Token not found")
@@ -486,12 +613,14 @@ class TokenManager:
             projects = self._sort_projects(projects)
 
             try:
-                while len(projects) < self._project_pool_size:
+                project_pool_size = self._get_project_pool_size()
+                while len(projects) < project_pool_size:
                     new_project = await self._create_project_for_token(token, len(projects) + 1)
                     projects.append(new_project)
                     projects = self._sort_projects(projects)
 
-                selected_project = self._select_next_project(token, projects)
+                selectable_projects = projects[:project_pool_size]
+                selected_project = self._select_next_project(token, selectable_projects)
                 await self.db.update_token(
                     token_id,
                     current_project_id=selected_project.project_id,
@@ -626,9 +755,14 @@ class TokenManager:
         try:
             result = await self.flow_client.get_credits(token.at)
             credits = result.get("credits", 0)
+            user_paygate_tier = result.get("userPaygateTier")
 
             # 更新数据库
-            await self.db.update_token(token_id, credits=credits)
+            await self.db.update_token(
+                token_id,
+                credits=credits,
+                user_paygate_tier=user_paygate_tier,
+            )
 
             return credits
         except Exception as e:
