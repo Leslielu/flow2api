@@ -819,6 +819,33 @@ class DrissionCaptchaService:
 
         debug_logger.log_info(f"[DrissionCaptcha] ✅ 常驻模式已启动 (project: {project_id})")
 
+    async def warmup_resident_tabs(self, project_ids, limit=None) -> list:
+        """适配 main.py 的统一启动接口，为每个 project_id 创建常驻标签页。"""
+        await self.initialize()
+        normalized = [str(p).strip() for p in (project_ids or []) if str(p).strip()]
+        if limit is not None:
+            normalized = normalized[:max(1, int(limit))]
+
+        warmed = []
+        for project_id in normalized:
+            if project_id in self._resident_tabs:
+                warmed.append(project_id)
+                continue
+            resident_info = await self._create_resident_tab(project_id)
+            if resident_info:
+                self._resident_tabs[project_id] = resident_info
+                self._running = True
+                self._last_page_refresh_at = time.time()
+                warmed.append(project_id)
+                debug_logger.log_info(f"[DrissionCaptcha] ✅ 常驻模式已启动 (project: {project_id})")
+            else:
+                debug_logger.log_warning(f"[DrissionCaptcha] 常驻标签页预热失败 (project: {project_id})")
+
+        if warmed and not self._heartbeat_task:
+            self._start_heartbeat()
+
+        return warmed
+
     async def stop_resident_mode(self, project_id: Optional[str] = None):
         """停止常驻模式
 
@@ -1094,19 +1121,9 @@ class DrissionCaptchaService:
             website_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
             debug_logger.log_info(f"[DrissionCaptcha] 为 project_id={project_id} 创建常驻标签页")
 
-            # 创建新标签页（先访问 Google 首页）
-            tab = await _run_in_thread(self._sync_new_tab, "https://www.google.com")
-            await asyncio.sleep(3)
-            debug_logger.log_info("[DrissionCaptcha] ✓ 已访问 www.google.com")
-
-            # 访问 Flow 中文首页
-            await _run_in_thread(self._sync_tab_get, tab, "https://labs.google/fx/zh/tools/flow")
-            await asyncio.sleep(3)
-            debug_logger.log_info("[DrissionCaptcha] ✓ 已访问 labs.google/fx/zh/tools/flow")
-
-            # 最后访问目标 URL
+            # 直接访问目标 URL
             debug_logger.log_info(f"[DrissionCaptcha] 正在访问目标 URL: {website_url}")
-            await _run_in_thread(self._sync_tab_get, tab, website_url)
+            tab = await _run_in_thread(self._sync_new_tab, website_url)
 
             # 等待页面加载完成
             page_loaded = await self._wait_page_load(tab, timeout=60)
