@@ -604,7 +604,9 @@ class DrissionCaptchaService:
             debug_logger.log_info(f"[AUTO_RECOVER] Token {token_id} ({email}): 尝试自动恢复...")
 
             from .token_manager import TokenManager
-            tm = TokenManager(self.db)
+            from .flow_client import FlowClient
+            from .proxy_manager import ProxyManager
+            tm = TokenManager(self.db, FlowClient(ProxyManager(self.db), self.db))
 
             # 用 ST 尝试刷新 AT
             result = await tm._do_refresh_at(token_id, st)
@@ -628,7 +630,9 @@ class DrissionCaptchaService:
             return
         try:
             from .token_manager import TokenManager
-            tm = TokenManager(self.db)
+            from .flow_client import FlowClient
+            from .proxy_manager import ProxyManager
+            tm = TokenManager(self.db, FlowClient(ProxyManager(self.db), self.db))
             tokens = await self.db.get_active_tokens()
             for token in tokens:
                 if not tm._should_refresh_at(token):
