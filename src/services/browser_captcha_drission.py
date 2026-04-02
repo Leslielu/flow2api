@@ -908,75 +908,84 @@ class DrissionCaptchaService:
         """
         debug_logger.log_info(f"[DrissionCaptcha] 开始执行 reCAPTCHA (action: {action})...")
 
-        # 先检查 grecaptcha 是否存在 (需要加 return 才能获取返回值)
-        check_script = "return typeof grecaptcha !== 'undefined' && typeof grecaptcha.enterprise !== 'undefined'"
-        has_recaptcha = await _run_in_thread(lambda: tab.run_js(check_script))
-        debug_logger.log_info(f"[DrissionCaptcha] reCAPTCHA 检查结果: {has_recaptcha}")
+        import json as _json
+        solve_timeout_ms = 45000  # 45 秒，与 upstream 保持一致
 
-        if not has_recaptcha:
-            debug_logger.log_error(f"[DrissionCaptcha] 页面没有 reCAPTCHA")
-            return None
-
-        # DrissionPage run_js 不支持 async/await 返回值，使用全局变量方式
-        ts = int(time.time() * 1000)
-        token_var = f"_recaptcha_token_{ts}"
-        status_var = f"_recaptcha_status_{ts}"
-
-        # 注入脚本 - 使用标准回调方式
-        script = f"""
-        (function() {{
-            window.{token_var} = null;
-            window.{status_var} = 'waiting';
-
-            if (typeof grecaptcha === 'undefined' || typeof grecaptcha.enterprise === 'undefined') {{
-                window.{status_var} = 'error:grecaptcha not defined';
-                return;
+        # 使用 CDP Runtime.evaluate + awaitPromise=True，单次调用等待 Promise resolve
+        # 原理与 nodriver 的 tab.evaluate(await_promise=True) 完全等效，去掉了轮询开销
+        async_script = f"""
+        (async () => {{
+            const finishError = (error) => {{
+                const message = error && error.message ? error.message : String(error || 'execute failed');
+                return {{ ok: false, error: message }};
+            }};
+            try {{
+                if (typeof grecaptcha === 'undefined' || typeof grecaptcha.enterprise === 'undefined') {{
+                    return {{ ok: false, error: 'grecaptcha not defined' }};
+                }}
+                const token = await new Promise((resolve, reject) => {{
+                    let settled = false;
+                    const done = (handler, value) => {{
+                        if (settled) return;
+                        settled = true;
+                        handler(value);
+                    }};
+                    const timer = setTimeout(() => {{
+                        done(reject, new Error('execute timeout'));
+                    }}, {solve_timeout_ms});
+                    try {{
+                        grecaptcha.enterprise.ready(() => {{
+                            grecaptcha.enterprise.execute({_json.dumps(self.website_key)}, {{action: {_json.dumps(action)}}})
+                                .then((token) => {{ clearTimeout(timer); done(resolve, token); }})
+                                .catch((error) => {{ clearTimeout(timer); done(reject, error); }});
+                        }});
+                    }} catch (error) {{
+                        clearTimeout(timer);
+                        done(reject, error);
+                    }}
+                }});
+                return {{ ok: true, token }};
+            }} catch (error) {{
+                return finishError(error);
             }}
-
-            grecaptcha.enterprise.ready(function() {{
-                grecaptcha.enterprise.execute('{self.website_key}', {{action: '{action}'}})
-                    .then(function(token) {{
-                        window.{token_var} = token;
-                        window.{status_var} = 'success';
-                    }})
-                    .catch(function(err) {{
-                        window.{status_var} = 'error:' + (err.message || 'unknown');
-                    }});
-            }});
         }})()
         """
 
-        # 执行注入脚本
-        inject_result = await _run_in_thread(lambda: tab.run_js(script))
-        debug_logger.log_info(f"[DrissionCaptcha] 注入脚本结果: {inject_result}")
-
-        # 轮询等待结果（最多 20 秒）
-        for i in range(40):
-            await asyncio.sleep(0.5)
-
-            # 检查状态 - 需要加 return 才能获取返回值
-            try:
-                status = await _run_in_thread(lambda: tab.run_js(f"return window.{status_var}"))
-                if status is None:
-                    status = await _run_in_thread(lambda: tab.run_js(f"return typeof window.{status_var} !== 'undefined' ? window.{status_var} : 'undefined'"))
-            except:
-                status = 'error:read_failed'
-
-            debug_logger.log_info(f"[DrissionCaptcha] 状态检查 (重试 {i+1}/40): {status}")
-
-            if status == 'success':
-                # 获取 token - 需要加 return
-                token = await _run_in_thread(lambda: tab.run_js(f"return window.{token_var}"))
-                if token and (token.startswith('03') or len(token) > 500):
-                    debug_logger.log_info(f"[DrissionCaptcha] ✅ Token 获取成功，长度: {len(token)}")
-                    return token
-
-            if status and isinstance(status, str) and status.startswith('error:'):
-                debug_logger.log_error(f"[DrissionCaptcha] 错误: {status}")
+        try:
+            cdp_result = await _run_in_thread(
+                lambda: tab.run_cdp(
+                    'Runtime.evaluate',
+                    expression=async_script,
+                    awaitPromise=True,
+                    returnByValue=True,
+                    timeout=solve_timeout_ms + 2000,
+                )
+            )
+            if 'exceptionDetails' in cdp_result:
+                err = cdp_result.get('exceptionDetails', {}).get('text', 'unknown CDP exception')
+                debug_logger.log_error(f"[DrissionCaptcha] CDP 异常: {err}")
                 return None
 
-        debug_logger.log_error(f"[DrissionCaptcha] 获取 token 超时")
-        return None
+            result = cdp_result.get('result', {}).get('value')
+            if not isinstance(result, dict):
+                debug_logger.log_error(f"[DrissionCaptcha] CDP 返回格式异常: {cdp_result}")
+                return None
+
+            if not result.get('ok'):
+                debug_logger.log_error(f"[DrissionCaptcha] reCAPTCHA 错误: {result.get('error')}")
+                return None
+
+            token = result.get('token')
+            if token:
+                debug_logger.log_info(f"[DrissionCaptcha] ✅ Token 获取成功，长度: {len(token)}")
+                return token
+
+            debug_logger.log_error("[DrissionCaptcha] Token 为空")
+            return None
+
+        except Exception as e:
+            debug_logger.log_error(f"[DrissionCaptcha] reCAPTCHA 执行异常: {e}")
+            return None
 
     # ==================== 主要 API ====================
 
