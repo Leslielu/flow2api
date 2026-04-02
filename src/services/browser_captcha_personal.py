@@ -451,8 +451,9 @@ class BrowserCaptchaService:
         self._initialized = False
         self.website_key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
         self.db = db
-        # 使用 None 让 nodriver 自动创建临时目录，避免目录锁定问题
-        self.user_data_dir = None
+        # 使用固定目录持久化 Google session，避免每次重启被识别为新设备
+        # 重启前需 kill Chrome 释放目录锁（见 CLAUDE.md 重启流程）
+        self.user_data_dir = os.path.join(os.getcwd(), "browser_data")
 
         # 常驻模式相关属性：打码标签页是全局共享池，不再按 project_id 一对一绑定
         self._resident_tabs: dict[str, 'ResidentTabInfo'] = {}  # slot_id -> 常驻标签页信息
