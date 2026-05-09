@@ -3,9 +3,10 @@ import asyncio
 import aiosqlite
 import json
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional, List, Dict, Any
 from pathlib import Path
+from .config import DEFAULT_YESCAPTCHA_TASK_TYPE, normalize_yescaptcha_task_type
 from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfig, GenerationConfig, CacheConfig, Project, CaptchaConfig, PluginConfig, CallLogicConfig
 
 
@@ -31,6 +32,10 @@ class Database:
         """Apply SQLite runtime settings for better concurrent behavior."""
         await db.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
         await db.execute("PRAGMA foreign_keys = ON")
+
+    def _current_stats_date(self) -> str:
+        """Return the logical date used by daily token statistics."""
+        return date.today().isoformat()
 
     @asynccontextmanager
     async def _connect(self, *, write: bool = False):
@@ -130,16 +135,24 @@ class Database:
         if count[0] == 0:
             image_timeout = 300
             video_timeout = 1500
+            max_retries = 3
 
             if config_dict:
                 generation_config = config_dict.get("generation", {})
+                flow_config = config_dict.get("flow", {})
                 image_timeout = generation_config.get("image_timeout", 300)
                 video_timeout = generation_config.get("video_timeout", 1500)
+                max_retries = flow_config.get("max_retries", 3)
+
+            try:
+                max_retries = max(1, int(max_retries))
+            except Exception:
+                max_retries = 3
 
             await db.execute("""
-                INSERT INTO generation_config (id, image_timeout, video_timeout)
-                VALUES (1, ?, ?)
-            """, (image_timeout, video_timeout))
+                INSERT INTO generation_config (id, image_timeout, video_timeout, max_retries)
+                VALUES (1, ?, ?, ?)
+            """, (image_timeout, video_timeout, max_retries))
 
         # Ensure call_logic_config has a row
         cursor = await db.execute("SELECT COUNT(*) FROM call_logic_config")
@@ -211,12 +224,14 @@ class Database:
             captcha_method = "browser"
             yescaptcha_api_key = ""
             yescaptcha_base_url = "https://api.yescaptcha.com"
+            yescaptcha_task_type = DEFAULT_YESCAPTCHA_TASK_TYPE
             remote_browser_base_url = ""
             remote_browser_api_key = ""
             remote_browser_timeout = 60
             browser_count = 1
             personal_project_pool_size = 4
             personal_max_resident_tabs = 5
+            browser_personal_fresh_restart_every_n_solves = 10
             personal_idle_tab_ttl_seconds = 600
 
             if config_dict:
@@ -224,12 +239,14 @@ class Database:
                 captcha_method = captcha_config.get("captcha_method", "browser")
                 yescaptcha_api_key = captcha_config.get("yescaptcha_api_key", "")
                 yescaptcha_base_url = captcha_config.get("yescaptcha_base_url", "https://api.yescaptcha.com")
+                yescaptcha_task_type = normalize_yescaptcha_task_type(captcha_config.get("yescaptcha_task_type"))
                 remote_browser_base_url = captcha_config.get("remote_browser_base_url", "")
                 remote_browser_api_key = captcha_config.get("remote_browser_api_key", "")
                 remote_browser_timeout = captcha_config.get("remote_browser_timeout", 60)
                 browser_count = captcha_config.get("browser_count", 1)
                 personal_project_pool_size = captcha_config.get("personal_project_pool_size", 4)
                 personal_max_resident_tabs = captcha_config.get("personal_max_resident_tabs", 5)
+                browser_personal_fresh_restart_every_n_solves = captcha_config.get("browser_personal_fresh_restart_every_n_solves", 10)
                 personal_idle_tab_ttl_seconds = captcha_config.get("personal_idle_tab_ttl_seconds", 600)
             try:
                 remote_browser_timeout = max(5, int(remote_browser_timeout))
@@ -248,6 +265,10 @@ class Database:
             except Exception:
                 personal_max_resident_tabs = 5
             try:
+                browser_personal_fresh_restart_every_n_solves = max(0, int(browser_personal_fresh_restart_every_n_solves))
+            except Exception:
+                browser_personal_fresh_restart_every_n_solves = 10
+            try:
                 personal_idle_tab_ttl_seconds = max(60, int(personal_idle_tab_ttl_seconds))
             except Exception:
                 personal_idle_tab_ttl_seconds = 600
@@ -255,21 +276,25 @@ class Database:
             await db.execute("""
                 INSERT INTO captcha_config (
                     id, captcha_method, yescaptcha_api_key, yescaptcha_base_url,
+                    yescaptcha_task_type,
                     remote_browser_base_url, remote_browser_api_key, remote_browser_timeout,
                     browser_count, personal_project_pool_size,
-                    personal_max_resident_tabs, personal_idle_tab_ttl_seconds
+                    personal_max_resident_tabs, browser_personal_fresh_restart_every_n_solves,
+                    personal_idle_tab_ttl_seconds
                 )
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 captcha_method,
                 yescaptcha_api_key,
                 yescaptcha_base_url,
+                yescaptcha_task_type,
                 remote_browser_base_url,
                 remote_browser_api_key,
                 remote_browser_timeout,
                 browser_count,
                 personal_project_pool_size,
                 personal_max_resident_tabs,
+                browser_personal_fresh_restart_every_n_solves,
                 personal_idle_tab_ttl_seconds,
             ))
 
@@ -351,6 +376,7 @@ class Database:
                         browser_driver TEXT DEFAULT 'nodriver',
                         yescaptcha_api_key TEXT DEFAULT '',
                         yescaptcha_base_url TEXT DEFAULT 'https://api.yescaptcha.com',
+                        yescaptcha_task_type TEXT DEFAULT 'RecaptchaV3TaskProxylessM1',
                         capmonster_api_key TEXT DEFAULT '',
                         capmonster_base_url TEXT DEFAULT 'https://api.capmonster.cloud',
                         ezcaptcha_api_key TEXT DEFAULT '',
@@ -365,7 +391,10 @@ class Database:
                         browser_proxy_enabled BOOLEAN DEFAULT 0,
                         browser_proxy_url TEXT,
                         browser_count INTEGER DEFAULT 1,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        personal_project_pool_size INTEGER DEFAULT 4,
+                        personal_max_resident_tabs INTEGER DEFAULT 5,
+                        browser_personal_fresh_restart_every_n_solves INTEGER DEFAULT 10,
+                        personal_idle_tab_ttl_seconds INTEGER DEFAULT 600,                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
@@ -398,6 +427,7 @@ class Database:
                     ("image_concurrency", "INTEGER DEFAULT -1"),
                     ("video_concurrency", "INTEGER DEFAULT -1"),
                     ("captcha_proxy_url", "TEXT"),  # token级打码代理
+                    ("extension_route_key", "TEXT"),  # extension 模式路由键
                     ("ban_reason", "TEXT"),  # 禁用原因
                     ("banned_at", "TIMESTAMP"),  # 禁用时间
                 ]
@@ -434,11 +464,26 @@ class Database:
                         except Exception as e:
                             print(f"  ✗ Failed to add column '{col_name}': {e}")
 
+            # Check and add missing columns to generation_config table
+            if await self._table_exists(db, "generation_config"):
+                generation_columns_to_add = [
+                    ("max_retries", "INTEGER DEFAULT 3"),
+                ]
+
+                for col_name, col_type in generation_columns_to_add:
+                    if not await self._column_exists(db, "generation_config", col_name):
+                        try:
+                            await db.execute(f"ALTER TABLE generation_config ADD COLUMN {col_name} {col_type}")
+                            print(f"  ✓ Added column '{col_name}' to generation_config table")
+                        except Exception as e:
+                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+
             # Check and add missing columns to captcha_config table
             if await self._table_exists(db, "captcha_config"):
                 captcha_columns_to_add = [
                     ("browser_proxy_enabled", "BOOLEAN DEFAULT 0"),
                     ("browser_proxy_url", "TEXT"),
+                    ("yescaptcha_task_type", "TEXT DEFAULT 'RecaptchaV3TaskProxylessM1'"),
                     ("capmonster_api_key", "TEXT DEFAULT ''"),
                     ("capmonster_base_url", "TEXT DEFAULT 'https://api.capmonster.cloud'"),
                     ("ezcaptcha_api_key", "TEXT DEFAULT ''"),
@@ -496,6 +541,7 @@ class Database:
                 captcha_columns_to_add = [
                     ("personal_project_pool_size", "INTEGER DEFAULT 4"),
                     ("personal_max_resident_tabs", "INTEGER DEFAULT 5"),
+                    ("browser_personal_fresh_restart_every_n_solves", "INTEGER DEFAULT 10"),
                     ("personal_idle_tab_ttl_seconds", "INTEGER DEFAULT 600"),
                 ]
 
@@ -543,6 +589,7 @@ class Database:
                     image_concurrency INTEGER DEFAULT -1,
                     video_concurrency INTEGER DEFAULT -1,
                     captcha_proxy_url TEXT,
+                    extension_route_key TEXT,
                     ban_reason TEXT,
                     banned_at TIMESTAMP
                 )
@@ -649,6 +696,7 @@ class Database:
                     id INTEGER PRIMARY KEY DEFAULT 1,
                     image_timeout INTEGER DEFAULT 300,
                     video_timeout INTEGER DEFAULT 1500,
+                    max_retries INTEGER DEFAULT 3,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -696,6 +744,7 @@ class Database:
                     browser_driver TEXT DEFAULT 'nodriver',
                     yescaptcha_api_key TEXT DEFAULT '',
                     yescaptcha_base_url TEXT DEFAULT 'https://api.yescaptcha.com',
+                    yescaptcha_task_type TEXT DEFAULT 'RecaptchaV3TaskProxylessM1',
                     capmonster_api_key TEXT DEFAULT '',
                     capmonster_base_url TEXT DEFAULT 'https://api.capmonster.cloud',
                     ezcaptcha_api_key TEXT DEFAULT '',
@@ -713,6 +762,7 @@ class Database:
                     browser_count INTEGER DEFAULT 1,
                     personal_project_pool_size INTEGER DEFAULT 4,
                     personal_max_resident_tabs INTEGER DEFAULT 5,
+                    browser_personal_fresh_restart_every_n_solves INTEGER DEFAULT 10,
                     personal_idle_tab_ttl_seconds INTEGER DEFAULT 600,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -821,13 +871,15 @@ class Database:
             cursor = await db.execute("""
                 INSERT INTO tokens (st, at, at_expires, email, name, remark, is_active,
                                    credits, user_paygate_tier, current_project_id, current_project_name,
-                                   image_enabled, video_enabled, image_concurrency, video_concurrency, captcha_proxy_url)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   image_enabled, video_enabled, image_concurrency, video_concurrency,
+                                   captcha_proxy_url, extension_route_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (token.st, token.at, token.at_expires, token.email, token.name, token.remark,
                   token.is_active, token.credits, token.user_paygate_tier,
                   token.current_project_id, token.current_project_name,
                   token.image_enabled, token.video_enabled,
-                  token.image_concurrency, token.video_concurrency, token.captcha_proxy_url))
+                  token.image_concurrency, token.video_concurrency,
+                  token.captcha_proxy_url, token.extension_route_key))
             await db.commit()
             token_id = cursor.lastrowid
 
@@ -881,16 +933,22 @@ class Database:
         """Get all tokens with merged statistics in one query"""
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
+            today = self._current_stats_date()
             cursor = await db.execute("""
                 SELECT
                     t.*,
                     COALESCE(ts.image_count, 0) AS image_count,
                     COALESCE(ts.video_count, 0) AS video_count,
-                    COALESCE(ts.error_count, 0) AS error_count
+                    COALESCE(ts.error_count, 0) AS error_count,
+                    COALESCE(CASE WHEN ts.today_date = ? THEN ts.today_image_count ELSE 0 END, 0) AS today_image_count,
+                    COALESCE(CASE WHEN ts.today_date = ? THEN ts.today_video_count ELSE 0 END, 0) AS today_video_count,
+                    COALESCE(CASE WHEN ts.today_date = ? THEN ts.today_error_count ELSE 0 END, 0) AS today_error_count,
+                    COALESCE(ts.consecutive_error_count, 0) AS consecutive_error_count,
+                    ts.last_error_at AS last_error_at
                 FROM tokens t
                 LEFT JOIN token_stats ts ON ts.token_id = t.id
                 ORDER BY t.created_at DESC
-            """)
+            """, (today, today, today))
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 
@@ -898,6 +956,7 @@ class Database:
         """Get dashboard counters with aggregated SQL queries"""
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
+            today = self._current_stats_date()
 
             token_cursor = await db.execute("""
                 SELECT
@@ -912,11 +971,11 @@ class Database:
                     COALESCE(SUM(image_count), 0) AS total_images,
                     COALESCE(SUM(video_count), 0) AS total_videos,
                     COALESCE(SUM(error_count), 0) AS total_errors,
-                    COALESCE(SUM(today_image_count), 0) AS today_images,
-                    COALESCE(SUM(today_video_count), 0) AS today_videos,
-                    COALESCE(SUM(today_error_count), 0) AS today_errors
+                    COALESCE(SUM(CASE WHEN today_date = ? THEN today_image_count ELSE 0 END), 0) AS today_images,
+                    COALESCE(SUM(CASE WHEN today_date = ? THEN today_video_count ELSE 0 END), 0) AS today_videos,
+                    COALESCE(SUM(CASE WHEN today_date = ? THEN today_error_count ELSE 0 END), 0) AS today_errors
                 FROM token_stats
-            """)
+            """, (today, today, today))
             stats_row = await stats_cursor.fetchone()
 
             token_data = dict(token_row) if token_row else {}
@@ -967,9 +1026,8 @@ class Database:
             params = []
 
             for key, value in kwargs.items():
-                if value is not None:
-                    updates.append(f"{key} = ?")
-                    params.append(value)
+                updates.append(f"{key} = ?")
+                params.append(value)
 
             if updates:
                 params.append(token_id)
@@ -1094,19 +1152,20 @@ class Database:
 
     async def increment_image_count(self, token_id: int):
         """Increment image generation count with daily reset"""
-        from datetime import date
         async with self._connect(write=True) as db:
-            today = str(date.today())
+            today = self._current_stats_date()
             # Get current stats
             cursor = await db.execute("SELECT today_date FROM token_stats WHERE token_id = ?", (token_id,))
             row = await cursor.fetchone()
 
-            # If date changed, reset today's count
+            # If date changed, reset all daily counters before recording today's image usage.
             if row and row[0] != today:
                 await db.execute("""
                     UPDATE token_stats
                     SET image_count = image_count + 1,
                         today_image_count = 1,
+                        today_video_count = 0,
+                        today_error_count = 0,
                         today_date = ?
                     WHERE token_id = ?
                 """, (today, token_id))
@@ -1123,19 +1182,20 @@ class Database:
 
     async def increment_video_count(self, token_id: int):
         """Increment video generation count with daily reset"""
-        from datetime import date
         async with self._connect(write=True) as db:
-            today = str(date.today())
+            today = self._current_stats_date()
             # Get current stats
             cursor = await db.execute("SELECT today_date FROM token_stats WHERE token_id = ?", (token_id,))
             row = await cursor.fetchone()
 
-            # If date changed, reset today's count
+            # If date changed, reset all daily counters before recording today's video usage.
             if row and row[0] != today:
                 await db.execute("""
                     UPDATE token_stats
                     SET video_count = video_count + 1,
+                        today_image_count = 0,
                         today_video_count = 1,
+                        today_error_count = 0,
                         today_date = ?
                     WHERE token_id = ?
                 """, (today, token_id))
@@ -1158,19 +1218,20 @@ class Database:
         - consecutive_error_count: Consecutive errors (reset on success/enable)
         - today_error_count: Today's errors (reset on date change)
         """
-        from datetime import date
         async with self._connect(write=True) as db:
-            today = str(date.today())
+            today = self._current_stats_date()
             # Get current stats
             cursor = await db.execute("SELECT today_date FROM token_stats WHERE token_id = ?", (token_id,))
             row = await cursor.fetchone()
 
-            # If date changed, reset today's error count
+            # If date changed, reset all daily counters before recording today's error.
             if row and row[0] != today:
                 await db.execute("""
                     UPDATE token_stats
                     SET error_count = error_count + 1,
                         consecutive_error_count = consecutive_error_count + 1,
+                        today_image_count = 0,
+                        today_video_count = 0,
                         today_error_count = 1,
                         today_date = ?,
                         last_error_at = CURRENT_TIMESTAMP
@@ -1295,14 +1356,49 @@ class Database:
                 return GenerationConfig(**dict(row))
             return None
 
-    async def update_generation_config(self, image_timeout: int, video_timeout: int):
+    async def update_generation_config(
+        self,
+        image_timeout: Optional[int] = None,
+        video_timeout: Optional[int] = None,
+        max_retries: Optional[int] = None,
+    ):
         """Update generation configuration"""
         async with self._connect(write=True) as db:
-            await db.execute("""
-                UPDATE generation_config
-                SET image_timeout = ?, video_timeout = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = 1
-            """, (image_timeout, video_timeout))
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM generation_config WHERE id = 1")
+            row = await cursor.fetchone()
+            current = dict(row) if row else {}
+
+            normalized_image_timeout = (
+                image_timeout
+                if image_timeout is not None
+                else current.get("image_timeout", 300)
+            )
+            normalized_video_timeout = (
+                video_timeout
+                if video_timeout is not None
+                else current.get("video_timeout", 1500)
+            )
+            try:
+                normalized_max_retries = (
+                    max(1, int(max_retries))
+                    if max_retries is not None
+                    else max(1, int(current.get("max_retries", 3)))
+                )
+            except Exception:
+                normalized_max_retries = 3
+
+            if row:
+                await db.execute("""
+                    UPDATE generation_config
+                    SET image_timeout = ?, video_timeout = ?, max_retries = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = 1
+                """, (normalized_image_timeout, normalized_video_timeout, normalized_max_retries))
+            else:
+                await db.execute("""
+                    INSERT INTO generation_config (id, image_timeout, video_timeout, max_retries)
+                    VALUES (1, ?, ?, ?)
+                """, (normalized_image_timeout, normalized_video_timeout, normalized_max_retries))
             await db.commit()
 
     async def get_call_logic_config(self) -> CallLogicConfig:
@@ -1534,6 +1630,7 @@ class Database:
         if generation_config:
             config.set_image_timeout(generation_config.image_timeout)
             config.set_video_timeout(generation_config.video_timeout)
+            config.set_flow_max_retries(generation_config.max_retries)
 
         # Reload call logic config
         call_logic_config = await self.get_call_logic_config()
@@ -1551,6 +1648,7 @@ class Database:
             config.set_captcha_method(captcha_config.captcha_method)
             config.set_yescaptcha_api_key(captcha_config.yescaptcha_api_key)
             config.set_yescaptcha_base_url(captcha_config.yescaptcha_base_url)
+            config.set_yescaptcha_task_type(captcha_config.yescaptcha_task_type)
             config.set_capmonster_api_key(captcha_config.capmonster_api_key)
             config.set_capmonster_base_url(captcha_config.capmonster_base_url)
             config.set_ezcaptcha_api_key(captcha_config.ezcaptcha_api_key)
@@ -1560,8 +1658,12 @@ class Database:
             config.set_remote_browser_base_url(captcha_config.remote_browser_base_url)
             config.set_remote_browser_api_key(captcha_config.remote_browser_api_key)
             config.set_remote_browser_timeout(captcha_config.remote_browser_timeout)
+            config.set_browser_count(captcha_config.browser_count)
             config.set_personal_project_pool_size(captcha_config.personal_project_pool_size)
             config.set_personal_max_resident_tabs(captcha_config.personal_max_resident_tabs)
+            config.set_browser_personal_fresh_restart_every_n_solves(
+                captcha_config.browser_personal_fresh_restart_every_n_solves
+            )
             config.set_personal_idle_tab_ttl_seconds(captcha_config.personal_idle_tab_ttl_seconds)
 
     # Cache config operations
@@ -1684,6 +1786,7 @@ class Database:
         browser_driver: str = None,
         yescaptcha_api_key: str = None,
         yescaptcha_base_url: str = None,
+        yescaptcha_task_type: str = None,
         capmonster_api_key: str = None,
         capmonster_base_url: str = None,
         ezcaptcha_api_key: str = None,
@@ -1698,6 +1801,7 @@ class Database:
         browser_count: int = None,
         personal_project_pool_size: int = None,
         personal_max_resident_tabs: int = None,
+        browser_personal_fresh_restart_every_n_solves: int = None,
         personal_idle_tab_ttl_seconds: int = None
     ):
         """Update captcha configuration"""
@@ -1712,6 +1816,9 @@ class Database:
                 new_driver = browser_driver if browser_driver is not None else current.get("browser_driver", "nodriver")
                 new_yes_key = yescaptcha_api_key if yescaptcha_api_key is not None else current.get("yescaptcha_api_key", "")
                 new_yes_url = yescaptcha_base_url if yescaptcha_base_url is not None else current.get("yescaptcha_base_url", "https://api.yescaptcha.com")
+                new_yes_task_type = normalize_yescaptcha_task_type(
+                    yescaptcha_task_type if yescaptcha_task_type is not None else current.get("yescaptcha_task_type")
+                )
                 new_cap_key = capmonster_api_key if capmonster_api_key is not None else current.get("capmonster_api_key", "")
                 new_cap_url = capmonster_base_url if capmonster_base_url is not None else current.get("capmonster_base_url", "https://api.capmonster.cloud")
                 new_ez_key = ezcaptcha_api_key if ezcaptcha_api_key is not None else current.get("ezcaptcha_api_key", "")
@@ -1726,34 +1833,46 @@ class Database:
                 new_browser_count = browser_count if browser_count is not None else current.get("browser_count", 1)
                 new_personal_project_pool_size = personal_project_pool_size if personal_project_pool_size is not None else current.get("personal_project_pool_size", 4)
                 new_personal_max_tabs = personal_max_resident_tabs if personal_max_resident_tabs is not None else current.get("personal_max_resident_tabs", 5)
+                new_personal_fresh_restart_every = (
+                    browser_personal_fresh_restart_every_n_solves
+                    if browser_personal_fresh_restart_every_n_solves is not None
+                    else current.get("browser_personal_fresh_restart_every_n_solves", 10)
+                )
                 new_personal_idle_ttl = personal_idle_tab_ttl_seconds if personal_idle_tab_ttl_seconds is not None else current.get("personal_idle_tab_ttl_seconds", 600)
                 new_remote_timeout = max(5, int(new_remote_timeout)) if new_remote_timeout is not None else 60
+                new_browser_count = max(1, min(20, int(new_browser_count)))
                 new_personal_project_pool_size = max(1, min(50, int(new_personal_project_pool_size)))
                 new_personal_max_tabs = max(1, min(50, int(new_personal_max_tabs)))  # 限制1-50
+                new_personal_fresh_restart_every = max(0, int(new_personal_fresh_restart_every))
                 new_personal_idle_ttl = max(60, int(new_personal_idle_ttl))  # 最少60秒
 
                 await db.execute("""
                     UPDATE captcha_config
-                    SET captcha_method = ?, browser_driver = ?, yescaptcha_api_key = ?, yescaptcha_base_url = ?,
+                    SET captcha_method = ?, yescaptcha_api_key = ?, yescaptcha_base_url = ?,
+                        yescaptcha_task_type = ?,
                         capmonster_api_key = ?, capmonster_base_url = ?,
                         ezcaptcha_api_key = ?, ezcaptcha_base_url = ?,
                         capsolver_api_key = ?, capsolver_base_url = ?,
                         remote_browser_base_url = ?, remote_browser_api_key = ?, remote_browser_timeout = ?,
                         browser_proxy_enabled = ?, browser_proxy_url = ?, browser_count = ?,
                         personal_project_pool_size = ?,
-                        personal_max_resident_tabs = ?, personal_idle_tab_ttl_seconds = ?,
+                        personal_max_resident_tabs = ?,
+                        browser_personal_fresh_restart_every_n_solves = ?,
+                        personal_idle_tab_ttl_seconds = ?,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = 1
-                """, (new_method, new_driver, new_yes_key, new_yes_url, new_cap_key, new_cap_url,
+                """, (new_method, new_yes_key, new_yes_url, new_yes_task_type,
+                      new_cap_key, new_cap_url,
                       new_ez_key, new_ez_url, new_cs_key, new_cs_url,
                       (new_remote_base_url or "").strip(), (new_remote_api_key or "").strip(), new_remote_timeout,
                       new_proxy_enabled, new_proxy_url, new_browser_count, new_personal_project_pool_size,
-                      new_personal_max_tabs, new_personal_idle_ttl))
+                      new_personal_max_tabs, new_personal_fresh_restart_every, new_personal_idle_ttl))
             else:
                 new_method = captcha_method if captcha_method is not None else "yescaptcha"
                 new_driver = browser_driver if browser_driver is not None else "nodriver"
                 new_yes_key = yescaptcha_api_key if yescaptcha_api_key is not None else ""
                 new_yes_url = yescaptcha_base_url if yescaptcha_base_url is not None else "https://api.yescaptcha.com"
+                new_yes_task_type = normalize_yescaptcha_task_type(yescaptcha_task_type)
                 new_cap_key = capmonster_api_key if capmonster_api_key is not None else ""
                 new_cap_url = capmonster_base_url if capmonster_base_url is not None else "https://api.capmonster.cloud"
                 new_ez_key = ezcaptcha_api_key if ezcaptcha_api_key is not None else ""
@@ -1768,26 +1887,36 @@ class Database:
                 new_browser_count = browser_count if browser_count is not None else 1
                 new_personal_project_pool_size = personal_project_pool_size if personal_project_pool_size is not None else 4
                 new_personal_max_tabs = personal_max_resident_tabs if personal_max_resident_tabs is not None else 5
+                new_personal_fresh_restart_every = (
+                    browser_personal_fresh_restart_every_n_solves
+                    if browser_personal_fresh_restart_every_n_solves is not None
+                    else 10
+                )
                 new_personal_idle_ttl = personal_idle_tab_ttl_seconds if personal_idle_tab_ttl_seconds is not None else 600
                 new_remote_timeout = max(5, int(new_remote_timeout))
+                new_browser_count = max(1, min(20, int(new_browser_count)))
                 new_personal_project_pool_size = max(1, min(50, int(new_personal_project_pool_size)))
                 new_personal_max_tabs = max(1, min(50, int(new_personal_max_tabs)))
+                new_personal_fresh_restart_every = max(0, int(new_personal_fresh_restart_every))
                 new_personal_idle_ttl = max(60, int(new_personal_idle_ttl))
 
                 await db.execute("""
-                    INSERT INTO captcha_config (id, captcha_method, browser_driver, yescaptcha_api_key, yescaptcha_base_url,
+                    INSERT INTO captcha_config (id, captcha_method, yescaptcha_api_key, yescaptcha_base_url,
+                        yescaptcha_task_type,
                         capmonster_api_key, capmonster_base_url, ezcaptcha_api_key, ezcaptcha_base_url,
                         capsolver_api_key, capsolver_base_url,
                         remote_browser_base_url, remote_browser_api_key, remote_browser_timeout,
                         browser_proxy_enabled, browser_proxy_url, browser_count,
                         personal_project_pool_size,
-                        personal_max_resident_tabs, personal_idle_tab_ttl_seconds)
-                    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (new_method, new_driver, new_yes_key, new_yes_url, new_cap_key, new_cap_url,
+                        personal_max_resident_tabs, browser_personal_fresh_restart_every_n_solves,
+                        personal_idle_tab_ttl_seconds)
+                    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (new_method, new_yes_key, new_yes_url, new_yes_task_type,
+                      new_cap_key, new_cap_url,
                       new_ez_key, new_ez_url, new_cs_key, new_cs_url,
                       (new_remote_base_url or "").strip(), (new_remote_api_key or "").strip(), new_remote_timeout,
                       new_proxy_enabled, new_proxy_url, new_browser_count, new_personal_project_pool_size,
-                      new_personal_max_tabs, new_personal_idle_ttl))
+                      new_personal_max_tabs, new_personal_fresh_restart_every, new_personal_idle_ttl))
 
             await db.commit()
 

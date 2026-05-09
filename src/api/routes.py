@@ -9,10 +9,10 @@ import re
 from urllib.parse import urlparse
 
 from curl_cffi.requests import AsyncSession
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from ..core.auth import verify_api_key_flexible
+from ..core.auth import AuthManager, verify_api_key_flexible
 from ..core.logger import debug_logger
 from ..core.model_resolver import get_base_model_aliases, resolve_model_name
 from ..core.models import (
@@ -22,12 +22,38 @@ from ..core.models import (
     GeminiGenerateContentRequest,
 )
 from ..services.generation_handler import MODEL_CONFIG, GenerationHandler
+from ..services.browser_captcha_extension import ExtensionCaptchaService
 
 router = APIRouter()
 
 MARKDOWN_IMAGE_RE = re.compile(r"!\[.*?\]\((.*?)\)")
 HTML_VIDEO_RE = re.compile(r"<video[^>]+src=['\"](.*?)['\"]", re.IGNORECASE)
 DATA_URL_RE = re.compile(r"^data:(?P<mime>[^;]+);base64,(?P<data>.+)$", re.DOTALL)
+MEDIA_PROMPT_TOOL_BLOCK_RE = re.compile(r"<tools>.*?</tools>", re.IGNORECASE | re.DOTALL)
+MEDIA_SYSTEM_INSTRUCTION_MARKERS = (
+    "<tools>",
+    "</tools>",
+    "function calling ai model",
+    "function signatures",
+    "\"$schema\"",
+    "\"additionalproperties\"",
+)
+MEDIA_PROMPT_PREAMBLE_PATTERNS = (
+    re.compile(r"^you are a function calling ai model\.?$", re.IGNORECASE),
+    re.compile(
+        r"^you are provided with function signatures within .* xml tags\.?$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^you may call one or more functions to assist with the user query\.?$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^don't make assumptions about what values to plug into functions\.?$",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^here are the available tools:.*$", re.IGNORECASE),
+)
 GEMINI_STATUS_MAP = {
     400: "INVALID_ARGUMENT",
     401: "UNAUTHENTICATED",
@@ -53,6 +79,7 @@ class NormalizedGenerationRequest:
     prompt: str
     images: List[bytes]
     messages: Optional[List[ChatMessage]] = None
+    video_media_id: Optional[str] = None
 
 
 def set_generation_handler(handler: GenerationHandler):
@@ -225,13 +252,54 @@ def _extract_text_from_gemini_content(content: Optional[GeminiContent]) -> str:
     return "\n".join(part for part in text_parts if part).strip()
 
 
+def _should_ignore_media_system_instruction(system_instruction: str) -> bool:
+    """Drop agent/tool scaffolding before sending media prompts upstream."""
+    if not system_instruction:
+        return False
+
+    normalized = system_instruction.lower()
+    if len(system_instruction) > 1200:
+        return True
+
+    return any(marker in normalized for marker in MEDIA_SYSTEM_INSTRUCTION_MARKERS)
+
+
+def _sanitize_media_prompt(prompt: str) -> str:
+    """Strip agent/tool scaffolding that image/video models cannot use."""
+    if not prompt:
+        return ""
+
+    sanitized = MEDIA_PROMPT_TOOL_BLOCK_RE.sub(" ", prompt.strip())
+    cleaned_lines: List[str] = []
+    for raw_line in sanitized.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if cleaned_lines and cleaned_lines[-1] != "":
+                cleaned_lines.append("")
+            continue
+        if any(pattern.fullmatch(line) for pattern in MEDIA_PROMPT_PREAMBLE_PATTERNS):
+            continue
+        cleaned_lines.append(line)
+
+    sanitized = "\n".join(cleaned_lines).strip()
+    sanitized = re.sub(r"\n{3,}", "\n\n", sanitized)
+    return sanitized.strip()
+
+
 async def _extract_prompt_and_images_from_openai_messages(
     messages: List[ChatMessage],
-) -> tuple[str, List[bytes]]:
+) -> tuple[str, List[bytes], Optional[str]]:
+    """Extract prompt, images, and optional video_media_id from messages.
+
+    Returns:
+        (prompt, images, video_media_id)
+        video_media_id is set when an image_url starts with "extend://"
+    """
     last_message = messages[-1]
     content = last_message.content
     prompt_parts: List[str] = []
     images: List[bytes] = []
+    video_media_id: Optional[str] = None
 
     if isinstance(content, str):
         prompt_parts.append(content)
@@ -244,10 +312,14 @@ async def _extract_prompt_and_images_from_openai_messages(
                     prompt_parts.append(text)
             elif item_type == "image_url":
                 image_url = item.get("image_url", {}).get("url", "")
-                images.append(await _load_image_bytes_from_uri(image_url))
+                # extend://MEDIA_ID 用于视频续写
+                if image_url.startswith("extend://"):
+                    video_media_id = image_url[len("extend://"):]
+                else:
+                    images.append(await _load_image_bytes_from_uri(image_url))
 
     prompt = "\n".join(part for part in prompt_parts if part).strip()
-    return prompt, images
+    return prompt, images, video_media_id
 
 
 async def _append_openai_reference_images(
@@ -352,7 +424,7 @@ async def _normalize_openai_request(
     request: ChatCompletionRequest,
 ) -> NormalizedGenerationRequest:
     if request.messages:
-        prompt, images = await _extract_prompt_and_images_from_openai_messages(
+        prompt, images, video_media_id = await _extract_prompt_and_images_from_openai_messages(
             request.messages
         )
         if request.image and not images:
@@ -364,6 +436,7 @@ async def _normalize_openai_request(
             prompt=prompt,
             images=images,
             messages=request.messages,
+            video_media_id=video_media_id,
         )
 
     if request.contents:
@@ -382,13 +455,27 @@ async def _normalize_gemini_request(
     model: str,
     request: GeminiGenerateContentRequest,
 ) -> NormalizedGenerationRequest:
+    resolved_model = _resolve_request_model(model, request)
     prompt, images = await _extract_prompt_and_images_from_gemini_contents(request.contents)
     system_instruction = _extract_text_from_gemini_content(request.systemInstruction)
+    model_config = MODEL_CONFIG.get(resolved_model)
+    media_model = bool(model_config and model_config.get("type") in {"image", "video"})
+
+    if media_model:
+        prompt = _sanitize_media_prompt(prompt)
+
     if system_instruction:
-        prompt = f"{system_instruction}\n\n{prompt}".strip()
+        if media_model and _should_ignore_media_system_instruction(system_instruction):
+            debug_logger.log_warning(
+                f"[GEMINI] 忽略媒体模型的 systemInstruction: model={resolved_model}, len={len(system_instruction)}"
+            )
+        else:
+            if media_model:
+                system_instruction = _sanitize_media_prompt(system_instruction)
+            prompt = f"{system_instruction}\n\n{prompt}".strip()
 
     return NormalizedGenerationRequest(
-        model=_resolve_request_model(model, request),
+        model=resolved_model,
         prompt=prompt,
         images=images,
     )
@@ -399,6 +486,7 @@ async def _collect_non_stream_result(
     prompt: str,
     images: List[bytes],
     base_url_override: Optional[str] = None,
+    video_media_id: Optional[str] = None,
 ) -> str:
     handler = _ensure_generation_handler()
     result = None
@@ -408,6 +496,7 @@ async def _collect_non_stream_result(
         images=images if images else None,
         stream=False,
         base_url_override=base_url_override,
+        video_media_id=video_media_id,
     ):
         result = chunk
 
@@ -636,6 +725,7 @@ async def _iterate_openai_stream(
         images=normalized.images if normalized.images else None,
         stream=True,
         base_url_override=base_url_override,
+        video_media_id=normalized.video_media_id,
     ):
         if chunk.startswith("data: "):
             yield chunk
@@ -659,6 +749,7 @@ async def _iterate_gemini_stream(
         images=normalized.images if normalized.images else None,
         stream=True,
         base_url_override=base_url_override,
+        video_media_id=normalized.video_media_id,
     ):
         if chunk.startswith("data: "):
             payload_text = chunk[6:].strip()
@@ -781,14 +872,13 @@ async def create_chat_completion(
                 },
             )
 
-        payload = _enrich_payload_with_direct_url(
-            _parse_handler_result(
-                await _collect_non_stream_result(
-                    normalized.model,
-                    normalized.prompt,
-                    normalized.images,
-                    request_base_url,
-                )
+        payload = _parse_handler_result(
+            await _collect_non_stream_result(
+                normalized.model,
+                normalized.prompt,
+                normalized.images,
+                base_url_override=request_base_url,
+                video_media_id=normalized.video_media_id,
             )
         )
         return _build_openai_json_response(payload)
@@ -821,7 +911,8 @@ async def generate_content(
                     normalized.model,
                     normalized.prompt,
                     normalized.images,
-                    request_base_url,
+                    base_url_override=request_base_url,
+                    video_media_id=normalized.video_media_id,
                 )
             )
         )
@@ -880,3 +971,32 @@ async def stream_generate_content(
             status_code=500,
             content=_build_gemini_error_payload(500, str(exc)),
         )
+
+@router.websocket("/captcha_ws")
+async def captcha_websocket_endpoint(websocket: WebSocket):
+    from ..core.logger import debug_logger
+    api_key = (
+        websocket.query_params.get("key")
+        or websocket.query_params.get("api_key")
+        or websocket.headers.get("x-goog-api-key")
+        or ""
+    ).strip()
+    authorization = (websocket.headers.get("authorization") or "").strip()
+    if authorization.lower().startswith("bearer "):
+        api_key = authorization[7:].strip()
+
+    if not api_key or not AuthManager.verify_api_key(api_key):
+        await websocket.close(code=1008)
+        return
+
+    service = await ExtensionCaptchaService.get_instance()
+    await service.connect(websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            await service.handle_message(websocket, data)
+    except WebSocketDisconnect:
+        service.disconnect(websocket)
+    except Exception as e:
+        debug_logger.log_error(f"WebSocket error: {e}")
+        service.disconnect(websocket)

@@ -34,6 +34,7 @@
 
 - 由于Flow增加了额外的验证码，你可以自行选择使用浏览器打码或第三发打码：
 注册[YesCaptcha](https://yescaptcha.com/i/13Xd8K)并获取api key，将其填入系统配置页面```YesCaptcha API密钥```区域
+- YesCaptcha 支持在管理页切换 `type`：`RecaptchaV3TaskProxyless`、`RecaptchaV3TaskProxylessM1`、`RecaptchaV3TaskProxylessM1S7`、`RecaptchaV3TaskProxylessM1S9`；S7/S9 会强制提交 `minScore` 0.7/0.9。
 - 默认 `docker-compose.yml` 建议搭配第三方打码（yescaptcha/capmonster/ezcaptcha/capsolver）。
 如需 Docker 内有头打码（browser/personal），请使用下方 `docker-compose.headed.yml`。
 
@@ -72,6 +73,7 @@ docker-compose -f docker-compose.warp.yml logs -f
 > 适用于你有虚拟化桌面需求、希望在容器里启用有头浏览器打码的场景。  
 > 该模式默认启动 `Xvfb + Fluxbox` 实现容器内部可视化，并设置 `ALLOW_DOCKER_HEADED_CAPTCHA=true`。  
 > 仅开放应用端口，不提供任何远程桌面连接端口。
+> `personal` 内置浏览器现在默认按有头模式启动；如需临时切回无头，可额外设置环境变量 `PERSONAL_BROWSER_HEADLESS=true`。
 
 ```bash
 # 启动有头模式（首次建议带 --build）
@@ -114,6 +116,14 @@ python main.py
 - **用户名**: `admin`
 - **密码**: `admin`
 
+## 📈 监控接口
+
+- `GET /health`：公开健康检查，返回服务是否存活、活跃 Token 数、即将过期 Token 数、已过期 Token 数、429 禁用数等摘要
+- `GET /metrics`：Prometheus 指标接口
+- `GET /api/tokens`：管理接口，返回 `at_expires`、`at_expired`、`at_expiring_within_1h`、`ban_reason`、`consecutive_error_count` 等 Token 状态
+
+Prometheus 可直接抓 `/metrics`。如果部署到 Kubernetes，建议只在集群内抓取，并在 Ingress/Gateway 层单独限制 `/metrics` 的外部访问。
+
 ### 模型测试页面
 
 访问 **http://localhost:8000/test** 可打开内置的模型测试页面，支持：
@@ -129,8 +139,6 @@ python main.py
 
 | 模型名称 | 说明| 尺寸 |
 |---------|--------|--------|
-| `gemini-2.5-flash-image-landscape` | 图/文生图 | 横屏 |
-| `gemini-2.5-flash-image-portrait` | 图/文生图 | 竖屏 |
 | `gemini-3.0-pro-image-landscape` | 图/文生图 | 横屏 |
 | `gemini-3.0-pro-image-portrait` | 图/文生图 | 竖屏 |
 | `gemini-3.0-pro-image-square` | 图/文生图 | 方图 |
@@ -173,16 +181,26 @@ python main.py
 |---------|---------|--------|
 | `veo_3_1_t2v_fast_portrait` | 文生视频 | 竖屏 |
 | `veo_3_1_t2v_fast_landscape` | 文生视频 | 横屏 |
-| `veo_2_1_fast_d_15_t2v_portrait` | 文生视频 | 竖屏 |
-| `veo_2_1_fast_d_15_t2v_landscape` | 文生视频 | 横屏 |
-| `veo_2_0_t2v_portrait` | 文生视频 | 竖屏 |
-| `veo_2_0_t2v_landscape` | 文生视频 | 横屏 |
 | `veo_3_1_t2v_fast_portrait_ultra` | 文生视频 | 竖屏 |
 | `veo_3_1_t2v_fast_ultra` | 文生视频 | 横屏 |
 | `veo_3_1_t2v_fast_portrait_ultra_relaxed` | 文生视频 | 竖屏 |
 | `veo_3_1_t2v_fast_ultra_relaxed` | 文生视频 | 横屏 |
 | `veo_3_1_t2v_portrait` | 文生视频 | 竖屏 |
 | `veo_3_1_t2v_landscape` | 文生视频 | 横屏 |
+| `veo_3_1_t2v_landscape_4s` | 文生视频 4秒 | 横屏 |
+| `veo_3_1_t2v_portrait_4s` | 文生视频 4秒 | 竖屏 |
+| `veo_3_1_t2v_landscape_6s` | 文生视频 6秒 | 横屏 |
+| `veo_3_1_t2v_portrait_6s` | 文生视频 6秒 | 竖屏 |
+| `veo_3_1_t2v_fast_landscape_4s` | 文生视频 Fast 4秒 | 横屏 |
+| `veo_3_1_t2v_fast_portrait_4s` | 文生视频 Fast 4秒 | 竖屏 |
+| `veo_3_1_t2v_fast_landscape_6s` | 文生视频 Fast 6秒 | 横屏 |
+| `veo_3_1_t2v_fast_portrait_6s` | 文生视频 Fast 6秒 | 竖屏 |
+| `veo_3_1_t2v_lite_portrait` | 文生视频 Lite | 竖屏 |
+| `veo_3_1_t2v_lite_landscape` | 文生视频 Lite | 横屏 |
+| `veo_3_1_t2v_lite_4s_portrait` | 文生视频 Lite 4秒 | 竖屏 |
+| `veo_3_1_t2v_lite_4s_landscape` | 文生视频 Lite 4秒 | 横屏 |
+| `veo_3_1_t2v_lite_6s_portrait` | 文生视频 Lite 6秒 | 竖屏 |
+| `veo_3_1_t2v_lite_6s_landscape` | 文生视频 Lite 6秒 | 横屏 |
 
 #### 首尾帧模型 (I2V - Image to Video)
 📸 **支持1-2张图片：1张作为首帧，2张作为首尾帧**
@@ -190,21 +208,39 @@ python main.py
 > 💡 **自动适配**：系统会根据图片数量自动选择对应的 model_key
 > - **单帧模式**（1张图）：使用首帧生成视频
 > - **双帧模式**（2张图）：使用首帧+尾帧生成过渡视频
+> - `veo_3_1_i2v_lite_*` 仅支持 **1 张** 首帧图片
+> - `veo_3_1_interpolation_lite_*` 仅支持 **2 张** 首尾帧图片
 
 | 模型名称 | 说明| 尺寸 |
 |---------|---------|--------|
 | `veo_3_1_i2v_s_fast_portrait_fl` | 图生视频 | 竖屏 |
 | `veo_3_1_i2v_s_fast_fl` | 图生视频 | 横屏 |
-| `veo_2_1_fast_d_15_i2v_portrait` | 图生视频 | 竖屏 |
-| `veo_2_1_fast_d_15_i2v_landscape` | 图生视频 | 横屏 |
-| `veo_2_0_i2v_portrait` | 图生视频 | 竖屏 |
-| `veo_2_0_i2v_landscape` | 图生视频 | 横屏 |
 | `veo_3_1_i2v_s_fast_portrait_ultra_fl` | 图生视频 | 竖屏 |
 | `veo_3_1_i2v_s_fast_ultra_fl` | 图生视频 | 横屏 |
 | `veo_3_1_i2v_s_fast_portrait_ultra_relaxed` | 图生视频 | 竖屏 |
 | `veo_3_1_i2v_s_fast_ultra_relaxed` | 图生视频 | 横屏 |
 | `veo_3_1_i2v_s_portrait` | 图生视频 | 竖屏 |
 | `veo_3_1_i2v_s_landscape` | 图生视频 | 横屏 |
+| `veo_3_1_i2v_s_landscape_4s` | 图生视频 4秒 | 横屏 |
+| `veo_3_1_i2v_s_portrait_4s` | 图生视频 4秒 | 竖屏 |
+| `veo_3_1_i2v_s_landscape_6s` | 图生视频 6秒 | 横屏 |
+| `veo_3_1_i2v_s_portrait_6s` | 图生视频 6秒 | 竖屏 |
+| `veo_3_1_i2v_s_fast_landscape_4s_fl` | 图生视频 Fast 4秒 | 横屏 |
+| `veo_3_1_i2v_s_fast_portrait_4s_fl` | 图生视频 Fast 4秒 | 竖屏 |
+| `veo_3_1_i2v_s_fast_landscape_6s_fl` | 图生视频 Fast 6秒 | 横屏 |
+| `veo_3_1_i2v_s_fast_portrait_6s_fl` | 图生视频 Fast 6秒 | 竖屏 |
+| `veo_3_1_i2v_lite_portrait` | 图生视频 Lite（仅首帧） | 竖屏 |
+| `veo_3_1_i2v_lite_landscape` | 图生视频 Lite（仅首帧） | 横屏 |
+| `veo_3_1_i2v_lite_4s_portrait` | 图生视频 Lite 4秒（仅首帧） | 竖屏 |
+| `veo_3_1_i2v_lite_4s_landscape` | 图生视频 Lite 4秒（仅首帧） | 横屏 |
+| `veo_3_1_i2v_lite_6s_portrait` | 图生视频 Lite 6秒（仅首帧） | 竖屏 |
+| `veo_3_1_i2v_lite_6s_landscape` | 图生视频 Lite 6秒（仅首帧） | 横屏 |
+| `veo_3_1_interpolation_lite_portrait` | 图生视频 Lite（首尾帧过渡） | 竖屏 |
+| `veo_3_1_interpolation_lite_landscape` | 图生视频 Lite（首尾帧过渡） | 横屏 |
+| `veo_3_1_interpolation_lite_4s_portrait` | 图生视频 Lite 4秒（首尾帧过渡） | 竖屏 |
+| `veo_3_1_interpolation_lite_4s_landscape` | 图生视频 Lite 4秒（首尾帧过渡） | 横屏 |
+| `veo_3_1_interpolation_lite_6s_portrait` | 图生视频 Lite 6秒（首尾帧过渡） | 竖屏 |
+| `veo_3_1_interpolation_lite_6s_landscape` | 图生视频 Lite 6秒（首尾帧过渡） | 横屏 |
 
 #### 多图生成 (R2V - Reference Images to Video)
 🖼️ **支持多张图片**
@@ -222,16 +258,30 @@ python main.py
 | 模型名称 | 说明| 尺寸 |
 |---------|---------|--------|
 | `veo_3_1_r2v_fast_portrait` | 图生视频 | 竖屏 |
-| `veo_3_1_r2v_fast` | 图生视频 | 横屏 |
+| `veo_3_1_r2v_fast_landscape` | 图生视频 | 横屏 |
 | `veo_3_1_r2v_fast_portrait_ultra` | 图生视频 | 竖屏 |
-| `veo_3_1_r2v_fast_ultra` | 图生视频 | 横屏 |
+| `veo_3_1_r2v_fast_landscape_ultra` | 图生视频 | 横屏 |
 | `veo_3_1_r2v_fast_portrait_ultra_relaxed` | 图生视频 | 竖屏 |
-| `veo_3_1_r2v_fast_ultra_relaxed` | 图生视频 | 横屏 |
+| `veo_3_1_r2v_fast_landscape_ultra_relaxed` | 图生视频 | 横屏 |
 
 #### 视频放大模型 (Upsample)
 
+这些模型不是直接调用上游 upsampler key，而是先用对应的 Veo 3.1 普通模型生成视频，再提交 1080P/4K 放大请求。
+
 | 模型名称 | 说明 | 输出 |
 |---------|---------|--------|
+| `veo_3_1_t2v_landscape_4k` | 文生视频放大 | 4K |
+| `veo_3_1_t2v_portrait_4k` | 文生视频放大 | 4K |
+| `veo_3_1_t2v_landscape_1080p` | 文生视频放大 | 1080P |
+| `veo_3_1_t2v_portrait_1080p` | 文生视频放大 | 1080P |
+| `veo_3_1_t2v_landscape_4s_4k` | 文生视频 4秒放大 | 4K |
+| `veo_3_1_t2v_portrait_4s_4k` | 文生视频 4秒放大 | 4K |
+| `veo_3_1_t2v_landscape_4s_1080p` | 文生视频 4秒放大 | 1080P |
+| `veo_3_1_t2v_portrait_4s_1080p` | 文生视频 4秒放大 | 1080P |
+| `veo_3_1_t2v_landscape_6s_4k` | 文生视频 6秒放大 | 4K |
+| `veo_3_1_t2v_portrait_6s_4k` | 文生视频 6秒放大 | 4K |
+| `veo_3_1_t2v_landscape_6s_1080p` | 文生视频 6秒放大 | 1080P |
+| `veo_3_1_t2v_portrait_6s_1080p` | 文生视频 6秒放大 | 1080P |
 | `veo_3_1_t2v_fast_portrait_4k` | 文生视频放大 | 4K |
 | `veo_3_1_t2v_fast_4k` | 文生视频放大 | 4K |
 | `veo_3_1_t2v_fast_portrait_ultra_4k` | 文生视频放大 | 4K |
@@ -244,10 +294,22 @@ python main.py
 | `veo_3_1_i2v_s_fast_ultra_fl_4k` | 图生视频放大 | 4K |
 | `veo_3_1_i2v_s_fast_portrait_ultra_fl_1080p` | 图生视频放大 | 1080P |
 | `veo_3_1_i2v_s_fast_ultra_fl_1080p` | 图生视频放大 | 1080P |
+| `veo_3_1_i2v_s_landscape_4k` | 图生视频放大 | 4K |
+| `veo_3_1_i2v_s_portrait_4k` | 图生视频放大 | 4K |
+| `veo_3_1_i2v_s_landscape_1080p` | 图生视频放大 | 1080P |
+| `veo_3_1_i2v_s_portrait_1080p` | 图生视频放大 | 1080P |
+| `veo_3_1_i2v_s_landscape_4s_4k` | 图生视频 4秒放大 | 4K |
+| `veo_3_1_i2v_s_portrait_4s_4k` | 图生视频 4秒放大 | 4K |
+| `veo_3_1_i2v_s_landscape_4s_1080p` | 图生视频 4秒放大 | 1080P |
+| `veo_3_1_i2v_s_portrait_4s_1080p` | 图生视频 4秒放大 | 1080P |
+| `veo_3_1_i2v_s_landscape_6s_4k` | 图生视频 6秒放大 | 4K |
+| `veo_3_1_i2v_s_portrait_6s_4k` | 图生视频 6秒放大 | 4K |
+| `veo_3_1_i2v_s_landscape_6s_1080p` | 图生视频 6秒放大 | 1080P |
+| `veo_3_1_i2v_s_portrait_6s_1080p` | 图生视频 6秒放大 | 1080P |
 | `veo_3_1_r2v_fast_portrait_ultra_4k` | 多图视频放大 | 4K |
-| `veo_3_1_r2v_fast_ultra_4k` | 多图视频放大 | 4K |
+| `veo_3_1_r2v_fast_landscape_ultra_4k` | 多图视频放大 | 4K |
 | `veo_3_1_r2v_fast_portrait_ultra_1080p` | 多图视频放大 | 1080P |
-| `veo_3_1_r2v_fast_ultra_1080p` | 多图视频放大 | 1080P |
+| `veo_3_1_r2v_fast_landscape_ultra_1080p` | 多图视频放大 | 1080P |
 
 ## 📡 API 使用示例（需要使用流式）
 
@@ -476,6 +538,14 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 ---
 
 **⭐ 如果这个项目对你有帮助，请给个 Star！**
+
+## 最近更新
+
+- `9f1d712` 同步 personal 打码逻辑，包含清理、浏览器参数和打码方式配置。
+- `da2ad06` 合并 PR #133。
+- `abd0c00` 修复 PR #133 合并后的集成问题。
+- `55431c9` 将 origin/main 同步到 PR #133。
+- `4b7a0ad` 新增 Prometheus 服务指标和 Token 健康监控。
 
 ## Star History
 

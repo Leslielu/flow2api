@@ -4,21 +4,21 @@ WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PLAYWRIGHT_BROWSERS_PATH=0 \
     ALLOW_DOCKER_HEADED_CAPTCHA=true \
     DISPLAY=:99 \
-    XVFB_WHD=1920x1080x24
+    PERSONAL_BROWSER_HEADLESS=0 \
+    PLAYWRIGHT_BROWSERS_PATH=0
 
-COPY requirements.txt ./
-
-# 有头模式基础依赖：虚拟显示、窗口管理器。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        curl \
-        xvfb \
         fluxbox \
+        x11-utils \
+        xauth \
+        xvfb \
     && rm -rf /var/lib/apt/lists/*
+
+# 在镜像构建阶段预装 Playwright Chromium，供 personal/browser 模式复用
+COPY requirements.txt ./
 
 RUN pip install --no-cache-dir --root-user-action=ignore -r requirements.txt \
     && python -m playwright install --with-deps chromium

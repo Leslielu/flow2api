@@ -3,6 +3,26 @@ import tomli
 from pathlib import Path
 from typing import Dict, Any, Optional
 
+DEFAULT_YESCAPTCHA_TASK_TYPE = "RecaptchaV3TaskProxylessM1"
+YESCAPTCHA_TASK_TYPE_OPTIONS = {
+    "RecaptchaV3TaskProxyless": None,
+    "RecaptchaV3TaskProxylessM1": None,
+    "RecaptchaV3TaskProxylessM1S7": 0.7,
+    "RecaptchaV3TaskProxylessM1S9": 0.9,
+}
+
+
+def normalize_yescaptcha_task_type(task_type: Optional[str]) -> str:
+    normalized = (task_type or "").strip()
+    if normalized in YESCAPTCHA_TASK_TYPE_OPTIONS:
+        return normalized
+    return DEFAULT_YESCAPTCHA_TASK_TYPE
+
+
+def get_yescaptcha_min_score(task_type: Optional[str]) -> Optional[float]:
+    return YESCAPTCHA_TASK_TYPE_OPTIONS.get(normalize_yescaptcha_task_type(task_type))
+
+
 class Config:
     """Application configuration"""
 
@@ -12,8 +32,11 @@ class Config:
         self._admin_password: Optional[str] = None
 
     def _load_config(self) -> Dict[str, Any]:
-        """Load configuration from setting.toml"""
-        config_path = Path(__file__).parent.parent.parent / "config" / "setting.toml"
+        """Load configuration from setting.toml, falling back to the example file."""
+        config_dir = Path(__file__).parent.parent.parent / "config"
+        config_path = config_dir / "setting.toml"
+        if not config_path.exists():
+            config_path = config_dir / "setting_example.toml"
         with open(config_path, "rb") as f:
             return tomli.load(f)
 
@@ -67,6 +90,16 @@ class Config:
             return max(1, int(retries))
         except Exception:
             return 3
+
+    def set_flow_max_retries(self, retries: int):
+        """Set flow max retries"""
+        if "flow" not in self._config:
+            self._config["flow"] = {}
+        try:
+            normalized = max(1, int(retries))
+        except Exception:
+            normalized = 3
+        self._config["flow"]["max_retries"] = normalized
 
     @property
     def flow_image_request_timeout(self) -> int:
@@ -384,6 +417,21 @@ class Config:
         self._config["captcha"]["browser_launch_background"] = bool(enabled)
 
     @property
+    def browser_count(self) -> int:
+        """浏览器打码实例数量，browser/personal 模式共用。"""
+        value = self._config.get("captcha", {}).get("browser_count", 1)
+        try:
+            return max(1, min(20, int(value)))
+        except Exception:
+            return 1
+
+    def set_browser_count(self, value: int):
+        """设置浏览器打码实例数量。"""
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["browser_count"] = max(1, min(20, int(value)))
+
+    @property
     def browser_recaptcha_settle_seconds(self) -> float:
         """有头打码在 reload/clr 就绪后的额外等待秒数。"""
         value = self._config.get("captcha", {}).get("browser_recaptcha_settle_seconds", 3.0)
@@ -446,6 +494,21 @@ class Config:
         self._config["captcha"]["personal_idle_tab_ttl_seconds"] = max(60, int(value))
 
     @property
+    def browser_personal_fresh_restart_every_n_solves(self) -> int:
+        """内置浏览器成功打码多少次后使用全新 profile 重启，0 表示禁用。"""
+        value = self._config.get("captcha", {}).get("browser_personal_fresh_restart_every_n_solves", 10)
+        try:
+            return max(0, int(value))
+        except Exception:
+            return 10
+
+    def set_browser_personal_fresh_restart_every_n_solves(self, value: int):
+        """设置内置浏览器 fresh profile 轮换阈值。"""
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["browser_personal_fresh_restart_every_n_solves"] = max(0, int(value))
+
+    @property
     def yescaptcha_api_key(self) -> str:
         """Get YesCaptcha API key"""
         return self._config.get("captcha", {}).get("yescaptcha_api_key", "")
@@ -466,6 +529,22 @@ class Config:
         if "captcha" not in self._config:
             self._config["captcha"] = {}
         self._config["captcha"]["yescaptcha_base_url"] = base_url
+
+    @property
+    def yescaptcha_task_type(self) -> str:
+        """Get YesCaptcha reCAPTCHA V3 task type"""
+        return normalize_yescaptcha_task_type(
+            self._config.get("captcha", {}).get(
+                "yescaptcha_task_type",
+                DEFAULT_YESCAPTCHA_TASK_TYPE,
+            )
+        )
+
+    def set_yescaptcha_task_type(self, task_type: str):
+        """Set YesCaptcha reCAPTCHA V3 task type"""
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["yescaptcha_task_type"] = normalize_yescaptcha_task_type(task_type)
 
     @property
     def capmonster_api_key(self) -> str:

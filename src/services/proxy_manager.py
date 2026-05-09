@@ -47,6 +47,7 @@ class ProxyManager:
 
         # 协议前缀格式
         if line.startswith(("http://", "https://", "socks5://", "socks5h://")):
+
             # 已是标准 user:pass@host:port（或 host:port）
             if "@" in line:
                 return line

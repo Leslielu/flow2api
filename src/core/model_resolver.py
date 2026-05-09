@@ -19,8 +19,6 @@ from ..core.logger import debug_logger
 # 简化模型名 → 基础模型名前缀 的映射
 # ──────────────────────────────────────────────
 IMAGE_BASE_MODELS = {
-    # Gemini 2.5 Flash (GEM_PIX)
-    "gemini-2.5-flash-image": "gemini-2.5-flash-image",
     # Gemini 3.0 Pro (GEM_PIX_2)
     "gemini-3.0-pro-image": "gemini-3.0-pro-image",
     # Gemini 3.1 Flash (NARWHAL)
@@ -57,7 +55,6 @@ ASPECT_RATIO_MAP = {
 # 每个基础模型支持的 aspectRatio 列表
 # 如果请求的 ratio 不在支持列表中，降级到默认值
 MODEL_SUPPORTED_ASPECTS = {
-    "gemini-2.5-flash-image": ["landscape", "portrait"],
     "gemini-3.0-pro-image": [
         "landscape",
         "portrait",
@@ -77,7 +74,6 @@ MODEL_SUPPORTED_ASPECTS = {
 
 # 每个基础模型支持的 imageSize（分辨率）列表
 MODEL_SUPPORTED_SIZES = {
-    "gemini-2.5-flash-image": [],  # 不支持放大
     "gemini-3.0-pro-image": ["2k", "4k"],
     "gemini-3.1-flash-image": ["2k", "4k"],
     "imagen-4.0-generate-preview": [],  # 不支持放大
@@ -91,6 +87,8 @@ IMAGE_SIZE_MAP = {
     "2K": "2k",
     "4k": "4k",
     "4K": "4k",
+    "1080p": "1080p",
+    "1080P": "1080p",
     "": "",
 }
 
@@ -130,13 +128,13 @@ VIDEO_BASE_MODELS = {
         "landscape": "veo_3_1_t2v_fast_landscape",
         "portrait": "veo_3_1_t2v_fast_portrait",
     },
-    "veo_2_1_fast_d_15_t2v": {
-        "landscape": "veo_2_1_fast_d_15_t2v_landscape",
-        "portrait": "veo_2_1_fast_d_15_t2v_portrait",
+    "veo_3_1_t2v_fast_4s": {
+        "landscape": "veo_3_1_t2v_fast_4s",
+        "portrait": "veo_3_1_t2v_fast_portrait_4s",
     },
-    "veo_2_0_t2v": {
-        "landscape": "veo_2_0_t2v_landscape",
-        "portrait": "veo_2_0_t2v_portrait",
+    "veo_3_1_t2v_fast_6s": {
+        "landscape": "veo_3_1_t2v_fast_6s",
+        "portrait": "veo_3_1_t2v_fast_portrait_6s",
     },
     "veo_3_1_t2v_fast_ultra": {
         "landscape": "veo_3_1_t2v_fast_ultra",
@@ -150,22 +148,62 @@ VIDEO_BASE_MODELS = {
         "landscape": "veo_3_1_t2v_landscape",
         "portrait": "veo_3_1_t2v_portrait",
     },
+    "veo_3_1_t2v_4s": {
+        "landscape": "veo_3_1_t2v_4s",
+        "portrait": "veo_3_1_t2v_portrait_4s",
+    },
+    "veo_3_1_t2v_6s": {
+        "landscape": "veo_3_1_t2v_6s",
+        "portrait": "veo_3_1_t2v_portrait_6s",
+    },
+    "veo_3_1_t2v_4s_4k": {
+        "landscape": "veo_3_1_t2v_4s_4k",
+        "portrait": "veo_3_1_t2v_portrait_4s_4k",
+    },
+    "veo_3_1_t2v_4s_1080p": {
+        "landscape": "veo_3_1_t2v_4s_1080p",
+        "portrait": "veo_3_1_t2v_portrait_4s_1080p",
+    },
+    "veo_3_1_t2v_6s_4k": {
+        "landscape": "veo_3_1_t2v_6s_4k",
+        "portrait": "veo_3_1_t2v_portrait_6s_4k",
+    },
+    "veo_3_1_t2v_6s_1080p": {
+        "landscape": "veo_3_1_t2v_6s_1080p",
+        "portrait": "veo_3_1_t2v_portrait_6s_1080p",
+    },
+    "veo_3_1_t2v_4k": {
+        "landscape": "veo_3_1_t2v_4k",
+        "portrait": "veo_3_1_t2v_portrait_4k",
+    },
+    "veo_3_1_t2v_1080p": {
+        "landscape": "veo_3_1_t2v_1080p",
+        "portrait": "veo_3_1_t2v_portrait_1080p",
+    },
     "veo_3_1_t2v_lite": {
         "landscape": "veo_3_1_t2v_lite_landscape",
         "portrait": "veo_3_1_t2v_lite_portrait",
+    },
+    "veo_3_1_t2v_lite_4s": {
+        "landscape": "veo_3_1_t2v_lite_4s_landscape",
+        "portrait": "veo_3_1_t2v_lite_4s_portrait",
+    },
+    "veo_3_1_t2v_lite_6s": {
+        "landscape": "veo_3_1_t2v_lite_6s_landscape",
+        "portrait": "veo_3_1_t2v_lite_6s_portrait",
     },
     # I2V models
     "veo_3_1_i2v_s_fast_fl": {
         "landscape": "veo_3_1_i2v_s_fast_fl",
         "portrait": "veo_3_1_i2v_s_fast_portrait_fl",
     },
-    "veo_2_1_fast_d_15_i2v": {
-        "landscape": "veo_2_1_fast_d_15_i2v_landscape",
-        "portrait": "veo_2_1_fast_d_15_i2v_portrait",
+    "veo_3_1_i2v_s_fast_4s_fl": {
+        "landscape": "veo_3_1_i2v_s_fast_4s_fl",
+        "portrait": "veo_3_1_i2v_s_fast_portrait_4s_fl",
     },
-    "veo_2_0_i2v": {
-        "landscape": "veo_2_0_i2v_landscape",
-        "portrait": "veo_2_0_i2v_portrait",
+    "veo_3_1_i2v_s_fast_6s_fl": {
+        "landscape": "veo_3_1_i2v_s_fast_6s_fl",
+        "portrait": "veo_3_1_i2v_s_fast_portrait_6s_fl",
     },
     "veo_3_1_i2v_s_fast_ultra_fl": {
         "landscape": "veo_3_1_i2v_s_fast_ultra_fl",
@@ -179,13 +217,61 @@ VIDEO_BASE_MODELS = {
         "landscape": "veo_3_1_i2v_s_landscape",
         "portrait": "veo_3_1_i2v_s_portrait",
     },
+    "veo_3_1_i2v_s_4s": {
+        "landscape": "veo_3_1_i2v_s_4s",
+        "portrait": "veo_3_1_i2v_s_portrait_4s",
+    },
+    "veo_3_1_i2v_s_6s": {
+        "landscape": "veo_3_1_i2v_s_6s",
+        "portrait": "veo_3_1_i2v_s_portrait_6s",
+    },
+    "veo_3_1_i2v_s_4s_4k": {
+        "landscape": "veo_3_1_i2v_s_4s_4k",
+        "portrait": "veo_3_1_i2v_s_portrait_4s_4k",
+    },
+    "veo_3_1_i2v_s_4s_1080p": {
+        "landscape": "veo_3_1_i2v_s_4s_1080p",
+        "portrait": "veo_3_1_i2v_s_portrait_4s_1080p",
+    },
+    "veo_3_1_i2v_s_6s_4k": {
+        "landscape": "veo_3_1_i2v_s_6s_4k",
+        "portrait": "veo_3_1_i2v_s_portrait_6s_4k",
+    },
+    "veo_3_1_i2v_s_6s_1080p": {
+        "landscape": "veo_3_1_i2v_s_6s_1080p",
+        "portrait": "veo_3_1_i2v_s_portrait_6s_1080p",
+    },
+    "veo_3_1_i2v_s_4k": {
+        "landscape": "veo_3_1_i2v_s_4k",
+        "portrait": "veo_3_1_i2v_s_portrait_4k",
+    },
+    "veo_3_1_i2v_s_1080p": {
+        "landscape": "veo_3_1_i2v_s_1080p",
+        "portrait": "veo_3_1_i2v_s_portrait_1080p",
+    },
     "veo_3_1_i2v_lite": {
         "landscape": "veo_3_1_i2v_lite_landscape",
         "portrait": "veo_3_1_i2v_lite_portrait",
     },
+    "veo_3_1_i2v_lite_4s": {
+        "landscape": "veo_3_1_i2v_lite_4s_landscape",
+        "portrait": "veo_3_1_i2v_lite_4s_portrait",
+    },
+    "veo_3_1_i2v_lite_6s": {
+        "landscape": "veo_3_1_i2v_lite_6s_landscape",
+        "portrait": "veo_3_1_i2v_lite_6s_portrait",
+    },
     "veo_3_1_interpolation_lite": {
         "landscape": "veo_3_1_interpolation_lite_landscape",
         "portrait": "veo_3_1_interpolation_lite_portrait",
+    },
+    "veo_3_1_interpolation_lite_4s": {
+        "landscape": "veo_3_1_interpolation_lite_4s_landscape",
+        "portrait": "veo_3_1_interpolation_lite_4s_portrait",
+    },
+    "veo_3_1_interpolation_lite_6s": {
+        "landscape": "veo_3_1_interpolation_lite_6s_landscape",
+        "portrait": "veo_3_1_interpolation_lite_6s_portrait",
     },
     # R2V models
     "veo_3_1_r2v_fast": {
@@ -199,6 +285,11 @@ VIDEO_BASE_MODELS = {
     "veo_3_1_r2v_fast_ultra_relaxed": {
         "landscape": "veo_3_1_r2v_fast_ultra_relaxed",
         "portrait": "veo_3_1_r2v_fast_portrait_ultra_relaxed",
+    },
+    # Extend models (视频续写)
+    "veo_3_1_extend": {
+        "landscape": "veo_3_1_extend",
+        "portrait": "veo_3_1_extend_portrait",
     },
 }
 
@@ -487,13 +578,16 @@ def resolve_model_name(
 
     # ────── 视频模型解析 ──────
     if model in VIDEO_BASE_MODELS:
-        aspect_ratio, _ = (
+        aspect_ratio, image_size = (
             _extract_generation_params(request) if request else (None, None)
         )
 
         # 视频默认横屏
         if not aspect_ratio or aspect_ratio not in ("landscape", "portrait"):
             aspect_ratio = "landscape"
+
+        if image_size in ("4k", "1080p") and f"{model}_{image_size}" in VIDEO_BASE_MODELS:
+            model = f"{model}_{image_size}"
 
         orientation_map = VIDEO_BASE_MODELS[model]
         resolved = orientation_map.get(aspect_ratio)
