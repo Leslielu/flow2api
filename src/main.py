@@ -82,11 +82,20 @@ async def lifespan(app: FastAPI):
             browser_service = await DrissionCaptchaService.get_instance(db)
             print("✓ Browser captcha service initialized (DrissionPage mode)")
         else:
-            from .services.browser_captcha_personal import BrowserCaptchaService
+            from .services.browser_captcha_personal import (
+                BrowserCaptchaService,
+                PERSONAL_POOL_MAX_TOTAL_RESIDENT_TABS,
+                resolve_effective_browser_count,
+                resolve_effective_personal_max_resident_tabs,
+            )
             browser_service = await BrowserCaptchaService.get_instance(db)
             print("✓ Browser captcha service initialized (nodriver mode)")
 
-        warmup_limit = max(1, int(config.personal_max_resident_tabs or 1))
+        warmup_limit = max(1, min(
+            PERSONAL_POOL_MAX_TOTAL_RESIDENT_TABS,
+            resolve_effective_browser_count(config.browser_count)
+            * resolve_effective_personal_max_resident_tabs(config.personal_max_resident_tabs),
+        ))
         warmup_project_ids = await token_manager.get_personal_warmup_project_ids(
             tokens=tokens,
             limit=warmup_limit,
