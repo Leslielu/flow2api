@@ -1680,6 +1680,15 @@ async def update_captcha_config(
         except Exception as e:
             print(f"[Admin] Personal 配置热更新失败: {e}")
 
+    # 如果使用 playwright 打码，热重载配置（代理变更会触发浏览器重启）
+    if captcha_method == "playwright":
+        try:
+            from ..services.browser_captcha_playwright import PlaywrightCaptchaService
+            service = await PlaywrightCaptchaService.get_instance(db)
+            await service.reload_config()
+        except Exception as e:
+            print(f"[Admin] Playwright 配置热更新失败: {e}")
+
     return {"success": True, "message": "验证码配置更新成功"}
 
 
@@ -1791,6 +1800,22 @@ async def test_captcha_score(
                     token_elapsed_ms = int(score_token_elapsed)
             if token_value:
                 fingerprint = service.get_last_fingerprint()
+                verify_proxy_used = bool(browser_proxy_enabled and browser_proxy_url)
+                verify_proxy_source = "captcha_browser_proxy" if verify_proxy_used else "browser_direct"
+                verify_proxy_url = browser_proxy_url if verify_proxy_used else ""
+        elif captcha_method == "playwright":
+            from ..services.browser_captcha_playwright import PlaywrightCaptchaService
+            service = await PlaywrightCaptchaService.get_instance(db)
+            score_payload = await service.get_custom_score(
+                website_url=website_url,
+                website_key=website_key,
+                verify_url=verify_url,
+                action=action,
+                enterprise=enterprise,
+            )
+            if isinstance(score_payload, dict):
+                token_value = score_payload.get("token")
+            if token_value:
                 verify_proxy_used = bool(browser_proxy_enabled and browser_proxy_url)
                 verify_proxy_source = "captcha_browser_proxy" if verify_proxy_used else "browser_direct"
                 verify_proxy_url = browser_proxy_url if verify_proxy_used else ""

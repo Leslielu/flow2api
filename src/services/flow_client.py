@@ -2954,6 +2954,29 @@ class FlowClient:
                 debug_logger.log_error(f"[reCAPTCHA Browser] 错误: {str(e)}")
                 self._set_request_fingerprint(None)
                 return None, None
+        # Playwright 固定 Profile 打码（真 Chrome + 含登录态的固定 profile）
+        elif captcha_method == "playwright":
+            try:
+                from .browser_captcha_playwright import PlaywrightCaptchaService
+                service = await PlaywrightCaptchaService.get_instance(self.db)
+                token, browser_ref = await service.get_token(project_id, action, token_id=token_id)
+                self._set_request_fingerprint(None)
+                return token, browser_ref
+            except RuntimeError as e:
+                # Docker 环境 / playwright 未安装等明确错误
+                debug_logger.log_error(f"[reCAPTCHA Playwright] {e}")
+                print(f"[reCAPTCHA] ❌ Playwright 打码失败: {e}")
+                self._set_request_fingerprint(None)
+                return None, None
+            except ImportError as e:
+                debug_logger.log_error(f"[reCAPTCHA Playwright] 导入失败: {e}")
+                print(f"[reCAPTCHA] ❌ playwright 未安装，请运行: pip install playwright")
+                self._set_request_fingerprint(None)
+                return None, None
+            except Exception as e:
+                debug_logger.log_error(f"[reCAPTCHA Playwright] 错误: {e}")
+                self._set_request_fingerprint(None)
+                return None, None
         elif captcha_method == "remote_browser":
             try:
                 solve_timeout = self._resolve_remote_browser_solve_timeout(action)

@@ -107,6 +107,27 @@ async def lifespan(app: FastAPI):
         browser_service = await BrowserCaptchaService.get_instance(db)
         await browser_service.warmup_browser_slots()
         print("? Browser captcha service initialized (headed mode)")
+    elif captcha_config.captcha_method == "playwright":
+        from .services.browser_captcha_playwright import PlaywrightCaptchaService
+        browser_service = await PlaywrightCaptchaService.get_instance(db)
+        # 取一个可用 token 的 project_id 用于建立常驻页（单页复用模型）
+        warmup_project_ids = await token_manager.get_personal_warmup_project_ids(
+            tokens=tokens,
+            limit=1,
+        )
+        try:
+            warmed = await browser_service.warmup_resident_tabs(warmup_project_ids, limit=1)
+            if warmed:
+                print(
+                    f"✓ Browser captcha service initialized "
+                    f"(Playwright fixed-profile mode, project={warmed[0]})"
+                )
+            elif tokens:
+                print("⚠ Playwright captcha warmup skipped: no tab warmed successfully")
+            else:
+                print("⚠ Playwright captcha warmup skipped: no active token")
+        except Exception as e:
+            print(f"⚠ Playwright captcha warmup failed: {type(e).__name__}: {e}")
 
     # Initialize concurrency manager
     await concurrency_manager.initialize(tokens)
