@@ -2960,7 +2960,11 @@ class FlowClient:
                 from .browser_captcha_playwright import PlaywrightCaptchaService
                 service = await PlaywrightCaptchaService.get_instance(self.db)
                 token, browser_ref = await service.get_token(project_id, action, token_id=token_id)
-                self._set_request_fingerprint(None)
+                # 注入浏览器真实 UA 到请求指纹，让 Flow API 提交请求与 reCAPTCHA token
+                # 生成时的 UA 一致，否则 Google reCAPTCHA enterprise 判 UNUSUAL_ACTIVITY →
+                # evaluation failed（与 personal/browser 方法、上游 053a341 同理）。
+                fingerprint = service.get_last_fingerprint() if token else None
+                self._set_request_fingerprint(fingerprint if token else None)
                 return token, browser_ref
             except RuntimeError as e:
                 # Docker 环境 / playwright 未安装等明确错误

@@ -88,6 +88,9 @@ class PlaywrightCaptchaService:
         # 缓存最近一次启动用的代理，用于 reload 时判断是否需要重启
         self._active_proxy_url: Optional[str] = None
 
+        # 最近一次取 token 时的浏览器指纹（含真实 UA），供 FlowClient 注入请求头
+        self._last_fingerprint: Optional[Dict[str, str]] = None
+
     # ==================== 单例 ====================
     @classmethod
     async def get_instance(cls, db=None) -> 'PlaywrightCaptchaService':
@@ -344,6 +347,16 @@ class PlaywrightCaptchaService:
             return None, None
 
         async with self._solve_lock:
+            # 先抓常驻页真实 User-Agent（与 token 同源同页），存入指纹供请求复用。
+            # 反检测 init 脚本未改 userAgent，故 navigator.userAgent 即真 Chrome UA。
+            # FlowClient 会把它注入请求头，确保提交请求与 token 生成时 UA 一致，
+            # 否则 Google reCAPTCHA enterprise 判 UNUSUAL_ACTIVITY → evaluation failed。
+            try:
+                user_agent = await page.evaluate("() => navigator.userAgent")
+            except Exception as e:
+                user_agent = None
+                debug_logger.log_warning(f"[PlaywrightCaptcha] 获取浏览器 UA 失败: {e}")
+            self._last_fingerprint = {"user_agent": user_agent} if user_agent else None
             token = await self._execute_recaptcha_on_page(page, action)
         if token:
             debug_logger.log_info(
@@ -352,6 +365,14 @@ class PlaywrightCaptchaService:
             return token, "playwright"
         debug_logger.log_error(f"[PlaywrightCaptcha] ❌ token 获取失败 (action={action})")
         return None, None
+
+    def get_last_fingerprint(self) -> Optional[Dict[str, str]]:
+        """返回最近一次取 token 时的浏览器指纹（含真实 UA）。
+
+        供 FlowClient._get_recaptcha_token 注入到请求指纹，让 Flow API 提交请求
+        沿用与 reCAPTCHA token 同源的 User-Agent，避免 UA 不一致导致 evaluation failed。
+        """
+        return self._last_fingerprint
 
     async def _execute_recaptcha_on_page(self, page, action: str = "IMAGE_GENERATION") -> Optional[str]:
         """在常驻页执行 grecaptcha.enterprise.execute 取 token（JS 与 Drission 等价）。"""
